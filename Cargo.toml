@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 # デバイス: OpenDeck と同じ crate（MPL-2.0）。async 機能（tokio）は使わない
 elgato-streamdeck = { version = "0.14.0", default-features = false }
+# HidApi を持つため（elgato-streamdeck が使う版と同じ）
+hidapi = "2.6"
 # elgato-streamdeck が使う版と同じ。DynamicImage を渡すためだけに使う
 image = { version = "0.25", default-features = false }
 # 文字の描画（mono フォントを同梱している）

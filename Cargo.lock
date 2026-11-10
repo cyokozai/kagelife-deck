@@ -163,6 +163,7 @@ version = "0.1.0"
 dependencies = [
  "elgato-streamdeck",
  "embedded-graphics",
+ "hidapi",
  "image",
  "serde",
  "serde_json",

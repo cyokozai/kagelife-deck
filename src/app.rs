@@ -105,7 +105,7 @@ impl<C: Control> App<C> {
     }
 
     #[cfg(test)]
-    fn ctl(&mut self) -> &mut C {
+    pub(crate) fn ctl_mut(&mut self) -> &mut C {
         &mut self.ctl
     }
 }
@@ -170,7 +170,7 @@ mod tests {
             ..Default::default()
         });
         a.poll();
-        a.ctl().calls.clear();
+        a.ctl_mut().calls.clear();
         a
     }
 
@@ -180,7 +180,7 @@ mod tests {
         a.poll();
         assert!(!a.online());
         assert_eq!(a.faces()[0].lines, vec!["offline"]);
-        a.ctl().state = Some(State::default());
+        a.ctl_mut().state = Some(State::default());
         a.poll();
         assert!(a.online());
         assert_eq!(a.faces()[KEY_STATUS].bg, color::STATUS_OK);
@@ -190,7 +190,7 @@ mod tests {
     fn fade_ではシェーダのキーで_crossfade() {
         let mut a = online(3);
         assert!(a.press(1, Instant::now()));
-        assert_eq!(a.ctl().calls, vec!["crossfade s01"]);
+        assert_eq!(a.ctl_mut().calls, vec!["crossfade s01"]);
     }
 
     #[test]
@@ -199,7 +199,7 @@ mod tests {
         assert!(!a.press(KEY_MODE, Instant::now()));
         assert_eq!(a.faces()[KEY_MODE].lines, vec!["CUT"]);
         a.press(2, Instant::now());
-        assert_eq!(a.ctl().calls, vec!["switch s02"]);
+        assert_eq!(a.ctl_mut().calls, vec!["switch s02"]);
         a.press(KEY_MODE, Instant::now());
         assert_eq!(a.faces()[KEY_MODE].lines[0], "FADE");
     }
@@ -208,7 +208,7 @@ mod tests {
     fn 空のキーは何も呼ばない() {
         let mut a = online(3);
         assert!(!a.press(5, Instant::now()));
-        assert!(a.ctl().calls.is_empty());
+        assert!(a.ctl_mut().calls.is_empty());
     }
 
     #[test]
@@ -216,12 +216,12 @@ mod tests {
         let mut a = online(12);
         a.press(KEY_NEXT, Instant::now());
         a.press(1, Instant::now());
-        assert_eq!(a.ctl().calls, vec!["crossfade s11"]);
+        assert_eq!(a.ctl_mut().calls, vec!["crossfade s11"]);
         // 2 ページしかないので、次で 1 ページ目に回り、前で 2 ページ目に回る
         a.press(KEY_NEXT, Instant::now());
         a.press(KEY_PREV, Instant::now());
         a.press(0, Instant::now());
-        assert_eq!(a.ctl().calls.last().unwrap(), "crossfade s10");
+        assert_eq!(a.ctl_mut().calls.last().unwrap(), "crossfade s10");
     }
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
         let mut a = online(25);
         a.press(KEY_PREV, Instant::now()); // 3 ページ目へ回る
         assert_eq!(a.faces()[KEY_PREV].lines[2], "3/3");
-        a.ctl().state.as_mut().unwrap().shaders.truncate(5);
+        a.ctl_mut().state.as_mut().unwrap().shaders.truncate(5);
         a.poll();
         assert_eq!(a.faces()[KEY_PREV].lines[2], "1/1");
     }
@@ -240,26 +240,26 @@ mod tests {
         let t = Instant::now();
         assert!(a.press(KEY_TAP, t));
         assert!(a.press(KEY_TAP, t + Duration::from_millis(500)));
-        assert_eq!(a.ctl().calls, vec!["bpm 120", "bpm 120"]);
+        assert_eq!(a.ctl_mut().calls, vec!["bpm 120", "bpm 120"]);
         a.press(KEY_TAP, t + Duration::from_millis(1100));
         // 1100ms に 2 間隔 → 109.09...
-        assert!(a.ctl().calls[2].starts_with("bpm 109.0"), "{:?}", a.ctl().calls);
+        assert!(a.ctl_mut().calls[2].starts_with("bpm 109.0"), "{:?}", a.ctl_mut().calls);
     }
 
     #[test]
     fn offline_では押しても呼ばず_取り直しだけ() {
         let mut a = App::new(Fake::default());
         a.poll();
-        a.ctl().calls.clear();
+        a.ctl_mut().calls.clear();
         assert!(a.press(0, Instant::now()));
         assert!(a.press(KEY_TAP, Instant::now()));
-        assert!(a.ctl().calls.is_empty());
+        assert!(a.ctl_mut().calls.is_empty());
     }
 
     #[test]
     fn 操作が失敗しても落ちない() {
         let mut a = online(2);
-        a.ctl().fail_actions = true;
+        a.ctl_mut().fail_actions = true;
         assert!(a.press(0, Instant::now()));
         assert!(a.online());
     }
