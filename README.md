@@ -19,7 +19,7 @@ Stream Deck MK.2 から [kagelife](https://github.com/cyokozai/kagelife) を操�
 
 - **1〜9**: kagelife の数字キーと同じシェーダに切り替えます。FADE のときはクロスフェード（kagelife の Shift＋数字）、CUT のときは即時切替です。どのシェーダがどの数字かは kagelife が決めます（ファイル名順。`-llm-slots` で変わります）
   - 左上に数字、active のシェーダに緑の枠、フェード先に橙の枠、コンパイルに失敗したシェーダに赤の枠と `ERR` を出します
-- **TAP**: 叩いた間隔から BPM を求めて kagelife に送ります。測り方は kagelife の内蔵タップと同じです（2 秒を超えて空くと測り直し、直近 8 回の平均、40〜300 に丸める）。1 回目のタップは今の BPM のまま拍頭を合わせます。キーには今の BPM を出し、測定値・設定値のときは青、既定の 120 のときは灰色にします
+- **TAP**: 叩いた間隔から BPM を求めて kagelife に送ります。測り方は kagelife の内蔵タップと同じです（2 秒を超えて空くと測り直し、直近 8 回の平均、40〜300 に丸める）。1 回目のタップは今の BPM を送り直して拍頭を合わせます。そのため、既定の 120 のままでも 1 回叩くとキーは青になります。キーには今の BPM を出し、kagelife が BPM を設定済みとみなしているとき（タップ・set_bpm の後）は青、起動したままの既定の 120 のときは灰色にします
 - **FADE / CUT**: 1〜9 を押したときの切替の方式です。FADE のときは今の拍数も出します
 - **0**: kagelife の `-llm-slots` の「戻る」（直前のシェーダへの即時切替）です
 - **`[` `]`**: クロスフェードの拍数を減らす・増やす（kagelife の `[` `]` と同じ）
@@ -80,7 +80,7 @@ kagelife-deck [--poll-hz <Hz>] [--brightness <0-100>] [--control-file <path>]
 
 | 引数 | 既定 | 意味 |
 |---|---|---|
-| `--poll-hz` | 2 | `GET /v1/state` を取り直す頻度（0.1〜30）。プレビューはこれと別に 10 Hz で取ります |
+| `--poll-hz` | 2 | `GET /v1/state` を取り直す頻度（0.1〜30）。プレビューはこれと別に 10 Hz で取ります（Stream Deck が挿さっている間だけ） |
 | `--brightness` | 60 | Stream Deck の明るさ（0〜100） |
 | `--control-file` | 下を参照 | kagelife の発見ファイル |
 
@@ -99,11 +99,11 @@ kagelife の制御口 v1（kagelife の `docs/adr/ADR-006-control-api.md`）だ�
 
 | 使う口 | 用途 |
 |---|---|
-| `GET /v1/state` | active・フェード・BPM・fps・エラー・`features`（既定 2 Hz、キーを押した直後にも取り直す） |
+| `GET /v1/state` | active・フェード・BPM・fps・エラー・`features`（既定 2 Hz、キーを押した直後にも取り直す。TAP の後は取り直さない） |
 | `POST /v1/crossfade` `{"name"}` | 古い kagelife で FADE のときの 1〜9（beats は送らず、kagelife の今の拍数を使う） |
 | `POST /v1/switch` `{"name"}` | 古い kagelife で CUT のときの 1〜9 |
 | `POST /v1/bpm` `{"bpm"}` | TAP |
-| `GET /v1/previews` | `features` に `previews` があるとき。プレビューと数字キーの割り当て（10 Hz、`frame` が前回と同じなら何もしない） |
+| `GET /v1/previews` | `features` に `previews` があり、Stream Deck が挿さっているとき。プレビューと数字キーの割り当て（10 Hz、`frame` が前回と同じなら何もしない。3 回続けて取れなければ文字の表示に戻す） |
 | `POST /v1/keys` `{"key","shift"}` | `features` に `previews` と `keys` があるとき。1〜9（FADE なら `shift: true`）・0・`[`・`]` |
 
 - 発見ファイルの `version` が 1 以外なら繋ぎません
