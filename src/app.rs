@@ -4,7 +4,7 @@
 //! GET /v1/previews から取り、スロットのキーは POST /v1/keys で押す（割り当てはデッキ側で再計算しない）。
 //! 持たない古い kagelife では、shaders の先頭 9 個をファイル名順で 1〜9 とみなし、switch / crossfade を呼ぶ。
 
-use crate::api::{ApiError, Control, FEATURE_KEYS, FEATURE_PREVIEWS, PreviewKey, State};
+use crate::api::{Control, FEATURE_KEYS, FEATURE_PREVIEWS, PreviewKey, State};
 use crate::render::SIZE;
 use crate::tap::{TapResult, Tapper};
 use crate::view::{self, Face, Mode, SLOT_KEYS, Slot};
@@ -29,7 +29,12 @@ pub struct App<C: Control> {
     previews: Option<PreviewSlots>,
     mode: Mode,
     tapper: Tapper,
+    /// previews の続けての失敗の回数
+    preview_failures: u32,
 }
+
+/// previews がこの回数続けて取れなければ、前のプレビューを捨てて文字の表示に戻す。
+const PREVIEW_FAILURES_TO_DROP: u32 = 3;
 
 impl<C: Control> App<C> {
     pub fn new(ctl: C) -> Self {
@@ -39,6 +44,7 @@ impl<C: Control> App<C> {
             previews: None,
             mode: Mode::Fade,
             tapper: Tapper::kagelife_default(),
+            preview_failures: 0,
         }
     }
 
@@ -74,6 +80,7 @@ impl<C: Control> App<C> {
                 }
                 self.state = None;
                 self.previews = None;
+                self.preview_failures = 0;
             }
         }
     }
@@ -84,12 +91,24 @@ impl<C: Control> App<C> {
             return;
         }
         let p = match self.ctl.previews() {
-            Ok(p) => p,
-            // 切れたかどうかは state の取り直しで決める
-            Err(ApiError::Offline(_)) => return,
+            Ok(p) => {
+                if self.preview_failures > 0 {
+                    eprintln!("kagelife-deck: previews を取れるようになった");
+                }
+                self.preview_failures = 0;
+                p
+            }
             Err(e) => {
-                eprintln!("kagelife-deck: previews を取れない: {e}");
-                self.previews = None;
+                // 一時的な失敗ではちらつかないよう前のプレビューを残す。
+                // 切れたかどうかは state の取り直しで決める（offline になれば poll が捨てる）
+                self.preview_failures += 1;
+                if self.preview_failures == 1 {
+                    eprintln!("kagelife-deck: previews を取れない: {e}");
+                }
+                if self.preview_failures == PREVIEW_FAILURES_TO_DROP && self.previews.is_some() {
+                    eprintln!("kagelife-deck: previews が続けて取れないので文字の表示に戻す");
+                    self.previews = None;
+                }
                 return;
             }
         };
@@ -166,7 +185,11 @@ impl<C: Control> App<C> {
                     TapResult::First => s.bpm,
                     TapResult::Measured(b) => b,
                 };
-                self.ctl.set_bpm(bpm)
+                if let Err(e) = self.ctl.set_bpm(bpm) {
+                    eprintln!("kagelife-deck: タップの BPM を送れない: {e}");
+                }
+                // 取り直しの HTTP で次のタップの読み出しが遅れないよう、取り直さない
+                return false;
             }
             view::KEY_STATUS => return true,
             // kagelife の 0 は Shift に関わらず即時切替なので shift は送らない
@@ -244,7 +267,7 @@ pub fn decode_preview(b64: &str) -> Option<Rc<[u8]>> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::api::Previews;
+    use crate::api::{ApiError, Previews};
     use crate::view::{KEY_BACK, KEY_BEAT_DOWN, KEY_BEAT_UP, KEY_MODE, KEY_STATUS, KEY_TAP, color};
     use std::time::Duration;
 
@@ -513,13 +536,47 @@ pub mod tests {
     }
 
     #[test]
-    fn previews_が取れなければ文字の表示に戻る() {
+    fn previews_が一時的に取れなくても前のプレビューを残し_3回続けば文字の表示に戻る() {
         let mut a = app(
             st(2, &["keys", "previews"]),
             previews(1, vec![pk("1", "x", None, false)]),
         );
         a.ctl_mut().previews = None; // 404
         a.poll_previews();
+        a.poll_previews();
+        assert_eq!(a.faces()[0].lines, vec!["x"], "2 回の失敗では残す");
+        a.poll_previews();
+        assert_eq!(a.faces()[0].lines, vec!["s01"], "3 回続けば捨てる");
+    }
+
+    #[test]
+    fn previews_の失敗の間に1回でも取れたら数え直す() {
+        let mut a = app(
+            st(2, &["keys", "previews"]),
+            previews(1, vec![pk("1", "x", None, false)]),
+        );
+        let good = a.ctl_mut().previews.take();
+        a.poll_previews();
+        a.poll_previews();
+        a.ctl_mut().previews = good;
+        a.poll_previews();
+        a.ctl_mut().previews = None;
+        a.poll_previews();
+        a.poll_previews();
+        assert_eq!(a.faces()[0].lines, vec!["x"]);
+    }
+
+    #[test]
+    fn offline_になればプレビューを捨てる() {
+        let mut a = app(
+            st(2, &["keys", "previews"]),
+            previews(1, vec![pk("1", "x", None, false)]),
+        );
+        a.ctl_mut().state = None;
+        a.poll();
+        a.ctl_mut().state = Some(st(2, &["keys", "previews"]));
+        a.ctl_mut().previews = None;
+        a.poll();
         assert_eq!(a.faces()[0].lines, vec!["s01"]);
     }
 
@@ -546,8 +603,9 @@ pub mod tests {
     fn 一回目のタップは今の_bpm_で拍頭を合わせ_二回目で測った値を送る() {
         let mut a = app(st(1, &[]), None);
         let t = Instant::now();
-        assert!(a.press(KEY_TAP, t));
-        assert!(a.press(KEY_TAP, t + Duration::from_millis(500)));
+        // タップの後は取り直さない（次のタップの時刻がずれないように）
+        assert!(!a.press(KEY_TAP, t));
+        assert!(!a.press(KEY_TAP, t + Duration::from_millis(500)));
         assert_eq!(a.ctl_mut().calls, vec!["bpm 120", "bpm 120"]);
         a.press(KEY_TAP, t + Duration::from_millis(1100));
         // 1100ms に 2 間隔 → 109.09...

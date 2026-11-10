@@ -78,7 +78,8 @@ impl<C: Control, O: Opener> Runner<C, O> {
             self.app.poll();
             self.next_poll = Instant::now() + self.poll_every;
         }
-        let previews = self.app.wants_previews();
+        // Stream Deck が無い間は取らない（kagelife が裏でプレビューを描き続けないように）
+        let previews = self.deck.is_some() && self.app.wants_previews();
         if previews && Instant::now() >= self.next_preview {
             self.app.poll_previews();
             self.next_preview = Instant::now() + self.preview_every;
@@ -328,6 +329,26 @@ mod tests {
         // frame が進み、スロット 1 の色が変わった → idx 0 だけ送る
         assert_eq!(log.borrow().calls, vec!["state", "previews", "previews"]);
         assert_eq!(&log.borrow().sent[15..], &[0]);
+    }
+
+    #[test]
+    fn stream_deck_が無い間は_previews_を取らない() {
+        let mut s = online().unwrap();
+        s.features = vec!["previews".into(), "keys".into()];
+        let (mut r, log) = setup(vec![], Some(s));
+        r.preview_every = Duration::ZERO;
+        r.turn();
+        r.turn();
+        assert!(!r.has_deck());
+        assert_eq!(log.borrow().calls, vec!["state"]);
+    }
+
+    #[test]
+    fn タップの後は取り直さない() {
+        let (mut r, log) = setup(vec![vec![Ok(Some(keys(&[3])))]], online());
+        r.turn();
+        r.turn();
+        assert_eq!(log.borrow().calls, vec!["state", "bpm 120"]);
     }
 
     #[test]

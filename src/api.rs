@@ -138,14 +138,28 @@ pub trait Control {
     fn key(&mut self, key: &str, shift: Option<bool>) -> Result<(), ApiError>;
 }
 
-/// 1 回の要求の待ち時間の上限。kagelife の loop_timeout（2 秒）より少し長くする。
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
+/// POST の待ち時間の上限。kagelife の loop_timeout（2 秒）より少し長くする。
+const POST_TIMEOUT: Duration = Duration::from_millis(2500);
+/// GET（state・previews）の待ち時間の上限。取り直しはすぐ次が来るので、入力を止める時間を短くする。
+const GET_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// HTTP で制御口を呼ぶ。接続の失敗と 401 のときは発見ファイルを読み直す。
 pub struct HttpControl {
     path: Option<PathBuf>,
     disc: Option<Discovery>,
-    agent: ureq::Agent,
+    get_agent: ureq::Agent,
+    post_agent: ureq::Agent,
+}
+
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        // 127.0.0.1 へ直接繋ぐ。環境変数のプロキシを使わない
+        .proxy(None)
+        .user_agent("kagelife-deck")
+        .build()
+        .into()
 }
 
 /// 送受信の結果（ステータスと本文）。Err は接続の失敗。
@@ -154,18 +168,11 @@ type Exchange = Result<(u16, Vec<u8>), String>;
 impl HttpControl {
     /// path は発見ファイルの場所。None なら常に offline。
     pub fn new(path: Option<PathBuf>) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            // 127.0.0.1 へ直接繋ぐ。環境変数のプロキシを使わない
-            .proxy(None)
-            .user_agent("kagelife-deck")
-            .build()
-            .into();
         Self {
             path,
             disc: None,
-            agent,
+            get_agent: agent(GET_TIMEOUT),
+            post_agent: agent(POST_TIMEOUT),
         }
     }
 
@@ -174,14 +181,14 @@ impl HttpControl {
         let auth = format!("Bearer {}", d.token);
         let res = match body {
             None => self
-                .agent
+                .get_agent
                 .get(&url)
                 .header("Authorization", &auth)
                 .header("Accept", "application/json")
                 .call(),
             Some(b) => {
                 debug_assert_eq!(method, "POST");
-                self.agent
+                self.post_agent
                     .post(&url)
                     .header("Authorization", &auth)
                     .header("Accept", "application/json")
@@ -595,6 +602,64 @@ mod tests {
             c.key("x", None),
             Err(ApiError::Status { code: 400, ref error, .. }) if error == "invalid_key"
         ));
+    }
+
+    /// 要求を読んでから delay 待って 200 を返す偽サーバ（1 回だけ）。
+    fn slow_server(delay: Duration) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                let h = h.trim_end().to_ascii_lowercase();
+                if h.is_empty() {
+                    break;
+                }
+                if let Some(v) = h.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut b = vec![0; len];
+            r.read_exact(&mut b).unwrap();
+            thread::sleep(delay);
+            let body = r#"{"bpm":120.0}"#;
+            let mut s = s;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        addr
+    }
+
+    #[test]
+    fn get_は1秒で諦める() {
+        let addr = slow_server(Duration::from_secs(3));
+        let f = TempFile::new("get-timeout");
+        f.write(&addr, "t");
+        let t = std::time::Instant::now();
+        assert!(matches!(
+            HttpControl::new(Some(f.0.clone())).state(),
+            Err(ApiError::Offline(_))
+        ));
+        let took = t.elapsed();
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_millis(1800),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn post_は1秒を超えても待つ() {
+        let addr = slow_server(Duration::from_millis(1500));
+        let f = TempFile::new("post-wait");
+        f.write(&addr, "t");
+        HttpControl::new(Some(f.0.clone())).set_bpm(120.0).unwrap();
     }
 
     #[test]
