@@ -100,3 +100,42 @@ impl Deck for HwDeck {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::render;
+    use crate::view::{Face, color};
+    use elgato_streamdeck::info::Kind;
+
+    /// 実機に送る直前までの計算量の目安（10 Hz で 9 スロットが毎回変わる場合の 10 秒分）。
+    /// `cargo test --release -- --ignored --nocapture 描画と変換` で測る。
+    #[test]
+    #[ignore]
+    fn 描画と変換の計算量() {
+        let fmt = Kind::Mk2.key_image_format();
+        let t = std::time::Instant::now();
+        let mut bytes = 0;
+        for frame in 0..100u32 {
+            for slot in 0..9u8 {
+                let face = Face {
+                    bg: color::BLACK,
+                    fg: color::WHITE,
+                    frame: Some(color::ACTIVE),
+                    lines: vec![],
+                    badge: Some((slot + 1).to_string()),
+                    image: Some(vec![(frame as u8).wrapping_mul(slot); SIZE * SIZE * 3].into()),
+                };
+                let rgb = render(&face);
+                let img = RgbImage::from_raw(SIZE as u32, SIZE as u32, rgb).unwrap();
+                bytes += convert_image_with_format(fmt, DynamicImage::ImageRgb8(img))
+                    .unwrap()
+                    .len();
+            }
+        }
+        println!(
+            "900 キー分（10 Hz × 9 キー × 10 秒）: {:?}、JPEG 計 {bytes} バイト",
+            t.elapsed()
+        );
+    }
+}
