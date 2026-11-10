@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: libudev を入れる（hidapi が使う）
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libudev-dev
+      - name: Rust の stable と rustfmt・clippy
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - name: 書式
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: テスト
+        run: cargo test --locked

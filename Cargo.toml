@@ -1,0 +1,33 @@
+[package]
+name = "kagelife-deck"
+version = "0.1.0"
+edition = "2024"
+description = "Stream Deck MK.2 から kagelife の制御口 v1 を操作する常駐アプリ（Linux）"
+publish = false
+
+[dependencies]
+# デバイス: OpenDeck と同じ crate（MPL-2.0）。async 機能（tokio）は使わない
+elgato-streamdeck = { version = "0.14.0", default-features = false }
+# HidApi を持つため（elgato-streamdeck が使う版と同じ）
+hidapi = "2.6"
+# elgato-streamdeck が使う版と同じ。DynamicImage を渡すのと、プレビューの JPEG の復号に使う
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# プレビューの base64（ureq が使う版と同じ）
+base64 = "0.23"
+# 文字の描画（mono フォントを同梱している）
+embedded-graphics = "0.8.2"
+# HTTP は平文の 127.0.0.1 だけなので TLS・gzip を外す
+ureq = { version = "3.5.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# 見本の PNG を書き出すテストだけが使う
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
