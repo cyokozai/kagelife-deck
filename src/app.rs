@@ -171,6 +171,7 @@ impl<C: Control> App<C> {
             return true;
         };
         let has_keys = s.has(FEATURE_KEYS);
+        let back = view::back_enabled(s, has_keys);
         let result = match key {
             view::KEY_MODE => {
                 self.mode = match self.mode {
@@ -193,7 +194,7 @@ impl<C: Control> App<C> {
             }
             view::KEY_STATUS => return true,
             // kagelife の 0 は Shift に関わらず即時切替なので shift は送らない
-            view::KEY_BACK if has_keys => self.ctl.key("0", None),
+            view::KEY_BACK if back => self.ctl.key("0", None),
             view::KEY_BEAT_DOWN if has_keys => self.ctl.key("[", None),
             view::KEY_BEAT_UP if has_keys => self.ctl.key("]", None),
             k => {
@@ -406,7 +407,7 @@ pub mod tests {
     fn 古い_kagelife_の_cut_は_switch() {
         let mut a = app(st(3, &[]), None);
         assert!(!a.press(KEY_MODE, Instant::now()));
-        assert_eq!(a.faces()[KEY_MODE].lines, vec!["CUT"]);
+        assert_eq!(a.faces()[KEY_MODE].lines[0], "CUT");
         a.press(2, Instant::now());
         assert_eq!(a.ctl_mut().calls, vec!["switch s03"]);
         a.press(KEY_MODE, Instant::now());
@@ -477,6 +478,20 @@ pub mod tests {
                 "key ]"
             ]
         );
+    }
+
+    #[test]
+    fn llm_slots_が空なら_0_は送らない() {
+        let mut s = st(1, &["keys", "previews", "llm_slots"]);
+        s.llm_slots = Some(vec![]);
+        let mut a = app(s, previews(1, vec![]));
+        assert!(!a.press(KEY_BACK, Instant::now()));
+        assert!(a.ctl_mut().calls.is_empty());
+        let mut s = st(1, &["keys", "previews", "llm_slots"]);
+        s.llm_slots = Some(vec!["llm_a".into()]);
+        let mut a = app(s, previews(1, vec![]));
+        a.press(KEY_BACK, Instant::now());
+        assert_eq!(a.ctl_mut().calls, vec!["key 0"]);
     }
 
     #[test]

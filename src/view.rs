@@ -66,9 +66,18 @@ pub struct Face {
     pub badge: Option<String>,
     /// プレビュー（72×72 の RGB）。あれば背景の代わりに敷く
     pub image: Option<Rc<[u8]>>,
+    /// 大きな字（FONT_10X20）で描く行の番号。他の行は FONT_7X14
+    pub big: Option<usize>,
+    /// 押した直後に明るくする
+    pub lit: bool,
 }
 
 impl Face {
+    fn with_big(mut self, i: usize) -> Self {
+        self.big = Some(i);
+        self
+    }
+
     fn new(bg: Rgb, fg: Rgb, lines: &[&str]) -> Self {
         Self {
             bg,
@@ -77,6 +86,8 @@ impl Face {
             lines: lines.iter().map(|s| s.to_string()).collect(),
             badge: None,
             image: None,
+            big: None,
+            lit: false,
         }
     }
 }
@@ -152,6 +163,8 @@ fn slot_face(s: &State, digit: usize, slot: Option<&Slot>) -> Face {
             lines: if error { vec!["ERR".into()] } else { vec![] },
             badge,
             image: Some(img.clone()),
+            big: None,
+            lit: false,
         },
         None => {
             let bg = match (target, active) {
@@ -170,9 +183,45 @@ fn slot_face(s: &State, digit: usize, slot: Option<&Slot>) -> Face {
                 lines,
                 badge,
                 image: None,
+                big: None,
+                lit: false,
             }
         }
     }
+}
+
+/// kagelife の `[` `]` が順に動くクロスフェードの拍数（shadermgr.FadePresets）。
+pub const FADE_PRESETS: [f64; 7] = [0.5, 1.0, 2.0, 3.0, 4.0, 8.0, 16.0];
+
+/// 拍数 beats で `[`（up = false）か `]`（up = true）を押した先の拍数。端なら None。
+/// beats が並びに無い（crossfade の beats 指定のフェード中）ときも None。
+pub fn beat_step(beats: f64, up: bool) -> Option<f64> {
+    let i = FADE_PRESETS.iter().position(|&b| b == beats)?;
+    let j = if up {
+        i.checked_add(1)?
+    } else {
+        i.checked_sub(1)?
+    };
+    FADE_PRESETS.get(j).copied()
+}
+
+/// 押した直後のキーを明るくする。flash は（キー、明るくしておく期限）。
+pub fn apply_flash(
+    faces: &mut [Face],
+    flash: Option<(usize, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    if let Some((k, until)) = flash
+        && now < until
+        && let Some(f) = faces.get_mut(k)
+    {
+        f.lit = true;
+    }
+}
+
+/// キー 0（戻る）を押せるか。keys が無い、または llm_slots が空なら押せない（llm_slots を出さない kagelife では押せる）。
+pub fn back_enabled(s: &State, keys: bool) -> bool {
+    keys && s.llm_slots.as_ref().is_none_or(|v| !v.is_empty())
 }
 
 /// 全キーの描画内容を決める。state が None なら offline の表示。
@@ -204,23 +253,49 @@ pub fn faces(state: Option<&State>, slots: &[Option<Slot>], mode: Mode, keys: bo
         Face::new(color::STATUS_OK, color::WHITE, &["ON", &fps])
     };
 
+    let beat = fmt_beats(s.fade.beats);
     v[KEY_MODE] = match mode {
         Mode::Fade => Face::new(
             color::MODE_FADE,
             color::WHITE,
-            &["FADE", &format!("{} beat", fmt_beats(s.fade.beats))],
+            &["FADE", "tap:CUT", &format!("{beat} beat")],
         ),
-        Mode::Cut => Face::new(color::MODE_CUT, color::WHITE, &["CUT"]),
-    };
+        Mode::Cut => Face::new(color::MODE_CUT, color::WHITE, &["CUT", "tap:FADE"]),
+    }
+    .with_big(0);
 
-    let (bg, fg) = if keys {
-        (color::NAV, color::WHITE)
+    v[KEY_BACK] = if !keys {
+        Face::new(color::DISABLED, color::DIM, &["BACK", "old kage"])
+    } else if !back_enabled(s, keys) {
+        Face::new(color::DISABLED, color::DIM, &["BACK", "no llm"])
     } else {
-        (color::DISABLED, color::DIM)
+        Face::new(color::NAV, color::WHITE, &["BACK", "to prev"])
+    }
+    .with_big(0);
+
+    let beat_key = |label: &str, up: bool| {
+        let next = match beat_step(s.fade.beats, up) {
+            Some(n) => Some(format!("{beat}>{}", fmt_beats(n))),
+            // 端（並びに無い拍数のときは押した先が分からないので出さない）
+            None if FADE_PRESETS.contains(&s.fade.beats) => {
+                Some(if up { "max" } else { "min" }.to_string())
+            }
+            None => None,
+        };
+        let mut lines = vec![label, beat.as_str()];
+        let tail = if keys { next } else { Some("old kage".into()) };
+        if let Some(t) = &tail {
+            lines.push(t);
+        }
+        let (bg, fg) = if keys {
+            (color::NAV, color::WHITE)
+        } else {
+            (color::DISABLED, color::DIM)
+        };
+        Face::new(bg, fg, &lines).with_big(1)
     };
-    v[KEY_BACK] = Face::new(bg, fg, &["0", "BACK"]);
-    v[KEY_BEAT_DOWN] = Face::new(bg, fg, &["[", "BEAT-"]);
-    v[KEY_BEAT_UP] = Face::new(bg, fg, &["]", "BEAT+"]);
+    v[KEY_BEAT_DOWN] = beat_key("BEAT -", false);
+    v[KEY_BEAT_UP] = beat_key("BEAT +", true);
     v
 }
 
@@ -370,19 +445,118 @@ mod tests {
         assert_eq!(a[0], b[0]);
     }
 
+    fn with_llm(mut s: State, slots: Option<&[&str]>) -> State {
+        s.llm_slots = slots.map(|v| v.iter().map(|x| x.to_string()).collect());
+        s
+    }
+
     #[test]
-    fn keys_が無ければ_0_と括弧は灰色() {
-        let s = state(1);
-        let off = faces(Some(&s), &[], Mode::Fade, false);
-        let on = faces(Some(&s), &[], Mode::Fade, true);
+    fn back_は_llm_slots_があれば有効() {
+        let s = with_llm(state(1), Some(&["llm_a"]));
+        let f = &faces(Some(&s), &[], Mode::Fade, true)[KEY_BACK];
+        assert_eq!(f.lines, vec!["BACK", "to prev"]);
+        assert_eq!(f.big, Some(0));
+        assert_eq!(f.bg, color::NAV);
+        assert_eq!(f.fg, color::WHITE);
+        // llm_slots を出さない kagelife では分からないので有効のまま
+        let s = with_llm(state(1), None);
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_BACK].bg,
+            color::NAV
+        );
+    }
+
+    #[test]
+    fn back_は_llm_slots_が空なら灰色で_no_llm() {
+        let s = with_llm(state(1), Some(&[]));
+        let f = &faces(Some(&s), &[], Mode::Fade, true)[KEY_BACK];
+        assert_eq!(f.lines, vec!["BACK", "no llm"]);
+        assert_eq!((f.bg, f.fg), (color::DISABLED, color::DIM));
+        assert!(!back_enabled(&s, true));
+        assert!(back_enabled(&with_llm(state(1), Some(&["x"])), true));
+    }
+
+    #[test]
+    fn keys_が無ければ_back_と括弧は灰色で_old_kage() {
+        let s = with_llm(state(1), Some(&["x"]));
+        let f = faces(Some(&s), &[], Mode::Fade, false);
+        assert_eq!(f[KEY_BACK].lines, vec!["BACK", "old kage"]);
+        assert_eq!(f[KEY_BEAT_DOWN].lines, vec!["BEAT -", "4", "old kage"]);
+        assert_eq!(f[KEY_BEAT_UP].lines, vec!["BEAT +", "4", "old kage"]);
         for k in [KEY_BACK, KEY_BEAT_DOWN, KEY_BEAT_UP] {
-            assert_eq!(off[k].bg, color::DISABLED);
-            assert_eq!(off[k].fg, color::DIM);
-            assert_eq!(on[k].bg, color::NAV);
+            assert_eq!((f[k].bg, f[k].fg), (color::DISABLED, color::DIM));
         }
-        assert_eq!(on[KEY_BEAT_DOWN].lines, vec!["[", "BEAT-"]);
-        assert_eq!(on[KEY_BEAT_UP].lines, vec!["]", "BEAT+"]);
-        assert_eq!(on[KEY_BACK].lines, vec!["0", "BACK"]);
+        assert!(!back_enabled(&s, false));
+    }
+
+    #[test]
+    fn 拍数の並び() {
+        assert_eq!(beat_step(4.0, false), Some(3.0));
+        assert_eq!(beat_step(4.0, true), Some(8.0));
+        assert_eq!(beat_step(1.0, false), Some(0.5));
+        assert_eq!(beat_step(0.5, false), None);
+        assert_eq!(beat_step(16.0, true), None);
+        assert_eq!(beat_step(6.0, true), None);
+    }
+
+    #[test]
+    fn 括弧のキーは今の拍数を大きく_押した先を小さく() {
+        let s = state(1);
+        let f = faces(Some(&s), &[], Mode::Fade, true);
+        assert_eq!(f[KEY_BEAT_DOWN].lines, vec!["BEAT -", "4", "4>3"]);
+        assert_eq!(f[KEY_BEAT_UP].lines, vec!["BEAT +", "4", "4>8"]);
+        assert_eq!(f[KEY_BEAT_DOWN].big, Some(1));
+        assert_eq!(f[KEY_BEAT_UP].bg, color::NAV);
+        let mut s = state(1);
+        s.fade.beats = 0.5;
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_BEAT_DOWN].lines,
+            vec!["BEAT -", "0.5", "min"]
+        );
+        s.fade.beats = 16.0;
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_BEAT_UP].lines,
+            vec!["BEAT +", "16", "max"]
+        );
+        // 並びに無い拍数（beats 指定のフェード中）は押した先を出さない
+        s.fade.beats = 6.0;
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_BEAT_UP].lines,
+            vec!["BEAT +", "6"]
+        );
+    }
+
+    #[test]
+    fn 方式のキーは今の方式を大きく_押した先と拍数を小さく() {
+        let mut s = state(1);
+        let f = &faces(Some(&s), &[], Mode::Fade, true)[KEY_MODE];
+        assert_eq!(f.lines, vec!["FADE", "tap:CUT", "4 beat"]);
+        assert_eq!(f.big, Some(0));
+        assert_eq!(f.bg, color::MODE_FADE);
+        s.fade.beats = 0.5;
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_MODE].lines[2],
+            "0.5 beat"
+        );
+        let f = &faces(Some(&s), &[], Mode::Cut, true)[KEY_MODE];
+        assert_eq!(f.lines, vec!["CUT", "tap:FADE"]);
+        assert_eq!(f.big, Some(0));
+        assert_eq!(f.bg, color::MODE_CUT);
+    }
+
+    #[test]
+    fn 押したキーは期限まで明るい() {
+        let t = std::time::Instant::now();
+        let until = t + std::time::Duration::from_millis(120);
+        let mut f = faces(Some(&state(1)), &[], Mode::Fade, true);
+        apply_flash(&mut f, Some((KEY_TAP, until)), t);
+        assert!(f[KEY_TAP].lit);
+        assert_eq!(f.iter().filter(|f| f.lit).count(), 1);
+        let mut f = faces(Some(&state(1)), &[], Mode::Fade, true);
+        apply_flash(&mut f, Some((KEY_TAP, until)), until);
+        assert!(!f[KEY_TAP].lit);
+        apply_flash(&mut f, None, t);
+        assert!(f.iter().all(|f| !f.lit));
     }
 
     #[test]
@@ -396,23 +570,6 @@ mod tests {
         let f = faces(Some(&s), &[], Mode::Fade, true);
         assert_eq!(f[KEY_TAP].lines, vec!["TAP", "128.2"]);
         assert_eq!(f[KEY_TAP].bg, color::TAP_MEASURED);
-    }
-
-    #[test]
-    fn 方式のキー() {
-        let mut s = state(1);
-        assert_eq!(
-            faces(Some(&s), &[], Mode::Fade, true)[KEY_MODE].lines,
-            vec!["FADE", "4 beat"]
-        );
-        s.fade.beats = 0.5;
-        assert_eq!(
-            faces(Some(&s), &[], Mode::Fade, true)[KEY_MODE].lines,
-            vec!["FADE", "0.5 beat"]
-        );
-        let f = faces(Some(&s), &[], Mode::Cut, true);
-        assert_eq!(f[KEY_MODE].lines, vec!["CUT"]);
-        assert_eq!(f[KEY_MODE].bg, color::MODE_CUT);
     }
 
     #[test]

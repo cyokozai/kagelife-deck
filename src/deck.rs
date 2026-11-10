@@ -89,6 +89,8 @@ mod tests {
             lines: vec![t.into()],
             badge: None,
             image: None,
+            big: None,
+            lit: false,
         }
     }
 

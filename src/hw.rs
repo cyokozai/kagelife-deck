@@ -125,6 +125,8 @@ mod tests {
                     lines: vec![],
                     badge: Some((slot + 1).to_string()),
                     image: Some(vec![(frame as u8).wrapping_mul(slot); SIZE * SIZE * 3].into()),
+                    big: None,
+                    lit: false,
                 };
                 let rgb = render(&face);
                 let img = RgbImage::from_raw(SIZE as u32, SIZE as u32, rgb).unwrap();

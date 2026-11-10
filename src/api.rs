@@ -30,6 +30,9 @@ pub struct State {
     /// 任意機能の名前（補足 20）。`previews`・`keys` があれば使う
     #[serde(default)]
     pub features: Vec<String>,
+    /// -llm-slots の予約名。出さない kagelife では None、フラグ無しなら空
+    #[serde(default)]
+    pub llm_slots: Option<Vec<String>>,
 }
 
 impl State {

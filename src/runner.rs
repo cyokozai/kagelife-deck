@@ -10,11 +10,14 @@ use crate::api::Control;
 use crate::app::App;
 use crate::deck::{Deck, KeyCache, pressed_edges, sync_keys};
 use crate::render::render;
+use crate::view::apply_flash;
 use std::time::{Duration, Instant};
 
 /// デバイスを開く。見つからなければ None。
 /// プレビューを取る間隔（kagelife の描く上限と同じ 10 fps）。
 pub const PREVIEW_EVERY: Duration = Duration::from_millis(100);
+/// 押したキーを明るくしておく時間。
+pub const FLASH_FOR: Duration = Duration::from_millis(120);
 
 pub trait Opener {
     fn open(&mut self) -> Option<Box<dyn Deck>>;
@@ -32,6 +35,9 @@ pub struct Runner<C: Control, O: Opener> {
     next_poll: Instant,
     next_scan: Instant,
     next_preview: Instant,
+    flash_for: Duration,
+    /// 明るくしているキーと、その期限
+    flash: Option<(usize, Instant)>,
 }
 
 impl<C: Control, O: Opener> Runner<C, O> {
@@ -49,6 +55,8 @@ impl<C: Control, O: Opener> Runner<C, O> {
             next_poll: now,
             next_scan: now,
             next_preview: now,
+            flash_for: FLASH_FOR,
+            flash: None,
         }
     }
 
@@ -84,10 +92,15 @@ impl<C: Control, O: Opener> Runner<C, O> {
             self.app.poll_previews();
             self.next_preview = Instant::now() + self.preview_every;
         }
-        if let Some(d) = self.deck.as_mut()
-            && let Err(e) = sync_keys(d.as_mut(), &mut self.cache, &self.app.faces(), render)
-        {
-            self.drop_deck(&e);
+        if self.flash.is_some_and(|(_, until)| Instant::now() >= until) {
+            self.flash = None;
+        }
+        if let Some(d) = self.deck.as_mut() {
+            let mut faces = self.app.faces();
+            apply_flash(&mut faces, self.flash, Instant::now());
+            if let Err(e) = sync_keys(d.as_mut(), &mut self.cache, &faces, render) {
+                self.drop_deck(&e);
+            }
         }
 
         let mut deadline = self.next_poll;
@@ -97,6 +110,9 @@ impl<C: Control, O: Opener> Runner<C, O> {
         if self.deck.is_none() {
             deadline = deadline.min(self.next_scan);
         }
+        if let Some((_, until)) = self.flash {
+            deadline = deadline.min(until);
+        }
         let wait = deadline.saturating_duration_since(Instant::now());
         let Some(d) = self.deck.as_mut() else {
             std::thread::sleep(wait);
@@ -105,7 +121,9 @@ impl<C: Control, O: Opener> Runner<C, O> {
         match d.read_buttons(wait) {
             Ok(Some(state)) => {
                 for k in pressed_edges(&mut self.buttons, &state) {
-                    if self.app.press(k, Instant::now()) {
+                    let now = Instant::now();
+                    self.flash = Some((k, now + self.flash_for));
+                    if self.app.press(k, now) {
                         self.next_poll = Instant::now();
                         self.next_preview = Instant::now();
                     }
@@ -349,6 +367,20 @@ mod tests {
         r.turn();
         r.turn();
         assert_eq!(log.borrow().calls, vec!["state", "bpm 120"]);
+    }
+
+    #[test]
+    fn 押したキーは少しの間だけ明るくして_戻す() {
+        let (mut r, log) = setup(vec![vec![Ok(Some(keys(&[3])))]], online());
+        r.flash_for = Duration::from_millis(30);
+        r.turn(); // 15 キー送る。TAP を押す
+        r.turn(); // TAP（idx 3）を明るくして送る
+        assert_eq!(&log.borrow().sent[15..], &[3]);
+        std::thread::sleep(Duration::from_millis(40));
+        r.turn(); // 期限が過ぎたので元に戻して送る
+        assert_eq!(&log.borrow().sent[15..], &[3, 3]);
+        r.turn();
+        assert_eq!(log.borrow().sent.len(), 17);
     }
 
     #[test]
