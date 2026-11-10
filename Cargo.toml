@@ -10,8 +10,10 @@ publish = false
 elgato-streamdeck = { version = "0.14.0", default-features = false }
 # HidApi を持つため（elgato-streamdeck が使う版と同じ）
 hidapi = "2.6"
-# elgato-streamdeck が使う版と同じ。DynamicImage を渡すためだけに使う
-image = { version = "0.25", default-features = false }
+# elgato-streamdeck が使う版と同じ。DynamicImage を渡すのと、プレビューの JPEG の復号に使う
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# プレビューの base64（ureq が使う版と同じ）
+base64 = "0.23"
 # 文字の描画（mono フォントを同梱している）
 embedded-graphics = "0.8.2"
 # HTTP は平文の 127.0.0.1 だけなので TLS・gzip を外す

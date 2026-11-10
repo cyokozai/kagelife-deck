@@ -1,20 +1,29 @@
-//! キーの描画内容（文字・色）の決定。描画そのもの（ピクセル）は render.rs。
+//! キーの描画内容（文字・色・プレビュー画像）の決定。描画そのもの（ピクセル）は render.rs。
 //!
-//! 配置（5 列 × 3 行。キー番号は左上から 0〜14）:
-//! - 0〜9: シェーダの一覧（10 個ずつのページ）
-//! - 10: 前のページ / 11: 次のページ / 12: タップ BPM / 13: 切替の方式（fade ↔ cut） / 14: 状態
+//! 配置（5 列 × 3 行。キー番号 idx = 行 * 5 + 列）。左 3 列は kagelife の数字キー 1〜9 と同じスロット:
+//!
+//! ```text
+//!  idx:  0  1  2 |  3     4
+//!        5  6  7 |  8     9
+//!       10 11 12 | 13    14
+//! 役割:  1  2  3 | TAP   状態
+//!        4  5  6 | 方式  0（戻る）
+//!        7  8  9 | [     ]
+//! ```
 
 use crate::api::State;
+use std::rc::Rc;
 
 /// キーの数（MK.2）。
 pub const KEYS: usize = 15;
-/// 1 ページに並べるシェーダの数。
-pub const PAGE_SIZE: usize = 10;
-pub const KEY_PREV: usize = 10;
-pub const KEY_NEXT: usize = 11;
-pub const KEY_TAP: usize = 12;
-pub const KEY_MODE: usize = 13;
-pub const KEY_STATUS: usize = 14;
+/// スロット 1〜9 のキー番号（読む順）。
+pub const SLOT_KEYS: [usize; 9] = [0, 1, 2, 5, 6, 7, 10, 11, 12];
+pub const KEY_TAP: usize = 3;
+pub const KEY_STATUS: usize = 4;
+pub const KEY_MODE: usize = 8;
+pub const KEY_BACK: usize = 9;
+pub const KEY_BEAT_DOWN: usize = 13;
+pub const KEY_BEAT_UP: usize = 14;
 
 /// 1 行に入る文字数（72px ÷ 7px の字幅。FONT_7X14 を使う）。
 pub const LINE_CHARS: usize = 10;
@@ -31,10 +40,11 @@ pub mod color {
     pub const DIM: Rgb = Rgb(90, 90, 90);
     pub const BLACK: Rgb = Rgb(0, 0, 0);
     pub const SHADER: Rgb = Rgb(32, 32, 40);
-    pub const ACTIVE: Rgb = Rgb(0, 110, 50);
-    pub const TARGET: Rgb = Rgb(190, 100, 0);
+    pub const ACTIVE: Rgb = Rgb(0, 200, 80);
+    pub const TARGET: Rgb = Rgb(255, 150, 0);
     pub const ERROR: Rgb = Rgb(220, 0, 0);
     pub const NAV: Rgb = Rgb(20, 20, 60);
+    pub const DISABLED: Rgb = Rgb(25, 25, 25);
     pub const TAP_DEFAULT: Rgb = Rgb(50, 50, 50);
     pub const TAP_MEASURED: Rgb = Rgb(0, 70, 160);
     pub const MODE_FADE: Rgb = Rgb(90, 0, 120);
@@ -49,9 +59,13 @@ pub mod color {
 pub struct Face {
     pub bg: Rgb,
     pub fg: Rgb,
-    /// 縁取り（エラーの印）
+    /// 縁取り（active・フェード先・エラーの印）
     pub frame: Option<Rgb>,
     pub lines: Vec<String>,
+    /// 左上に小さく出す数字キーの番号
+    pub badge: Option<String>,
+    /// プレビュー（72×72 の RGB）。あれば背景の代わりに敷く
+    pub image: Option<Rc<[u8]>>,
 }
 
 impl Face {
@@ -61,6 +75,8 @@ impl Face {
             fg,
             frame: None,
             lines: lines.iter().map(|s| s.to_string()).collect(),
+            badge: None,
+            image: None,
         }
     }
 }
@@ -72,26 +88,17 @@ pub enum Mode {
     Cut,
 }
 
-/// シェーダ n 個のページ数（0 個でも 1）。
-pub fn page_count(n: usize) -> usize {
-    n.div_ceil(PAGE_SIZE).max(1)
+/// 数字キーに割り当たったシェーダ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    pub name: String,
+    pub image: Option<Rc<[u8]>>,
+    pub compile_error: bool,
 }
 
-/// ページ送り（端で反対側へ回る）。delta は +1 か -1。
-pub fn step_page(page: usize, delta: isize, n: usize) -> usize {
-    let pc = page_count(n) as isize;
-    (page as isize + delta).rem_euclid(pc) as usize
-}
-
-/// page の key 番目（0〜9）に並ぶシェーダの名前。
-pub fn shader_at(state: &State, page: usize, key: usize) -> Option<&str> {
-    if key >= PAGE_SIZE {
-        return None;
-    }
-    state
-        .shaders
-        .get(page * PAGE_SIZE + key)
-        .map(String::as_str)
+/// キー番号 idx がスロットなら 0 始まりの番号（数字キーは +1）。
+pub fn slot_of_key(idx: usize) -> Option<usize> {
+    SLOT_KEYS.iter().position(|&k| k == idx)
 }
 
 /// 名前を LINE_CHARS 文字ずつに折り返す。NAME_LINES 行を超える分は最後の行の末尾を `~` にして切る。
@@ -119,69 +126,101 @@ fn fmt_beats(b: f64) -> String {
     }
 }
 
+fn slot_face(s: &State, digit: usize, slot: Option<&Slot>) -> Face {
+    let badge = Some(digit.to_string());
+    let Some(slot) = slot else {
+        let mut f = Face::new(color::BLACK, color::DIM, &[]);
+        f.badge = badge;
+        return f;
+    };
+    let target = s.fade.fading && s.fade.target == slot.name;
+    let active = s.active == slot.name;
+    let error = slot.compile_error || s.last_error.as_ref().is_some_and(|e| e.shader == slot.name);
+    let role = if target {
+        Some(color::TARGET)
+    } else if active {
+        Some(color::ACTIVE)
+    } else {
+        None
+    };
+    let frame = if error { Some(color::ERROR) } else { role };
+    match &slot.image {
+        Some(img) => Face {
+            bg: color::BLACK,
+            fg: color::WHITE,
+            frame,
+            lines: if error { vec!["ERR".into()] } else { vec![] },
+            badge,
+            image: Some(img.clone()),
+        },
+        None => {
+            let bg = match (target, active) {
+                (true, _) => Rgb(120, 70, 0),
+                (false, true) => Rgb(0, 100, 40),
+                _ => color::SHADER,
+            };
+            let mut lines = wrap_name(&slot.name);
+            if error {
+                lines.push("ERR".into());
+            }
+            Face {
+                bg,
+                fg: color::WHITE,
+                frame,
+                lines,
+                badge,
+                image: None,
+            }
+        }
+    }
+}
+
 /// 全キーの描画内容を決める。state が None なら offline の表示。
-pub fn faces(state: Option<&State>, page: usize, mode: Mode) -> Vec<Face> {
+/// keys は feature `keys` の有無（無ければ 0・`[`・`]` を灰色で無効にする）。
+pub fn faces(state: Option<&State>, slots: &[Option<Slot>], mode: Mode, keys: bool) -> Vec<Face> {
     let Some(s) = state else {
         return (0..KEYS)
             .map(|_| Face::new(color::OFFLINE, color::WHITE, &["offline"]))
             .collect();
     };
-    let mut v = Vec::with_capacity(KEYS);
-    let err_shader = s.last_error.as_ref().map(|e| e.shader.as_str());
-    for key in 0..PAGE_SIZE {
-        v.push(match shader_at(s, page, key) {
-            None => Face::new(color::BLACK, color::WHITE, &[]),
-            Some(name) => {
-                let bg = if s.fade.fading && s.fade.target == name {
-                    color::TARGET
-                } else if s.active == name {
-                    color::ACTIVE
-                } else {
-                    color::SHADER
-                };
-                let mut f = Face {
-                    bg,
-                    fg: color::WHITE,
-                    frame: None,
-                    lines: wrap_name(name),
-                };
-                if err_shader == Some(name) {
-                    f.frame = Some(color::ERROR);
-                    f.lines.push("ERR".into());
-                }
-                f
-            }
-        });
+    let mut v: Vec<Face> = (0..KEYS)
+        .map(|_| Face::new(color::BLACK, color::WHITE, &[]))
+        .collect();
+    for (i, &k) in SLOT_KEYS.iter().enumerate() {
+        v[k] = slot_face(s, i + 1, slots.get(i).and_then(Option::as_ref));
     }
-
-    let pc = page_count(s.shaders.len());
-    let pos = format!("{}/{}", page + 1, pc);
-    let nav_fg = if pc > 1 { color::WHITE } else { color::DIM };
-    v.push(Face::new(color::NAV, nav_fg, &["<", "PAGE", &pos]));
-    v.push(Face::new(color::NAV, nav_fg, &[">", "PAGE", &pos]));
 
     let tap_bg = if s.bpm_measured {
         color::TAP_MEASURED
     } else {
         color::TAP_DEFAULT
     };
-    v.push(Face::new(tap_bg, color::WHITE, &["TAP", &format!("{:.1}", s.bpm)]));
+    v[KEY_TAP] = Face::new(tap_bg, color::WHITE, &["TAP", &format!("{:.1}", s.bpm)]);
 
-    v.push(match mode {
+    let fps = format!("{:.0}fps", s.fps);
+    v[KEY_STATUS] = if s.last_error.is_some() {
+        Face::new(color::STATUS_ERR, color::WHITE, &["ON", &fps, "ERR"])
+    } else {
+        Face::new(color::STATUS_OK, color::WHITE, &["ON", &fps])
+    };
+
+    v[KEY_MODE] = match mode {
         Mode::Fade => Face::new(
             color::MODE_FADE,
             color::WHITE,
             &["FADE", &format!("{} beat", fmt_beats(s.fade.beats))],
         ),
         Mode::Cut => Face::new(color::MODE_CUT, color::WHITE, &["CUT"]),
-    });
+    };
 
-    let fps = format!("{:.0}fps", s.fps);
-    v.push(if s.last_error.is_some() {
-        Face::new(color::STATUS_ERR, color::WHITE, &["ON", &fps, "ERR"])
+    let (bg, fg) = if keys {
+        (color::NAV, color::WHITE)
     } else {
-        Face::new(color::STATUS_OK, color::WHITE, &["ON", &fps])
-    });
+        (color::DISABLED, color::DIM)
+    };
+    v[KEY_BACK] = Face::new(bg, fg, &["0", "BACK"]);
+    v[KEY_BEAT_DOWN] = Face::new(bg, fg, &["[", "BEAT-"]);
+    v[KEY_BEAT_UP] = Face::new(bg, fg, &["]", "BEAT+"]);
     v
 }
 
@@ -192,8 +231,8 @@ mod tests {
 
     fn state(n: usize) -> State {
         State {
-            active: "s00".into(),
-            shaders: (0..n).map(|i| format!("s{i:02}")).collect(),
+            active: "s01".into(),
+            shaders: (1..=n).map(|i| format!("s{i:02}")).collect(),
             bpm: 120.0,
             fade: Fade {
                 beats: 4.0,
@@ -204,30 +243,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ページ数() {
-        assert_eq!(page_count(0), 1);
-        assert_eq!(page_count(1), 1);
-        assert_eq!(page_count(10), 1);
-        assert_eq!(page_count(11), 2);
-        assert_eq!(page_count(25), 3);
+    fn slot(name: &str) -> Option<Slot> {
+        Some(Slot {
+            name: name.into(),
+            image: None,
+            compile_error: false,
+        })
+    }
+
+    fn img() -> Rc<[u8]> {
+        vec![7u8; 72 * 72 * 3].into()
     }
 
     #[test]
-    fn ページ送りは端で回る() {
-        assert_eq!(step_page(0, 1, 25), 1);
-        assert_eq!(step_page(2, 1, 25), 0);
-        assert_eq!(step_page(0, -1, 25), 2);
-        assert_eq!(step_page(0, 1, 3), 0);
-    }
-
-    #[test]
-    fn ページの中のシェーダ() {
-        let s = state(13);
-        assert_eq!(shader_at(&s, 0, 0), Some("s00"));
-        assert_eq!(shader_at(&s, 1, 2), Some("s12"));
-        assert_eq!(shader_at(&s, 1, 3), None);
-        assert_eq!(shader_at(&s, 0, 10), None);
+    fn スロットのキー番号() {
+        assert_eq!(slot_of_key(0), Some(0));
+        assert_eq!(slot_of_key(2), Some(2));
+        assert_eq!(slot_of_key(5), Some(3));
+        assert_eq!(slot_of_key(12), Some(8));
+        for k in [3, 4, 8, 9, 13, 14] {
+            assert_eq!(slot_of_key(k), None);
+        }
     }
 
     #[test]
@@ -243,66 +279,121 @@ mod tests {
 
     #[test]
     fn offline_は全キーに出す() {
-        let f = faces(None, 0, Mode::Fade);
+        let f = faces(None, &[], Mode::Fade, true);
         assert_eq!(f.len(), KEYS);
-        assert!(f.iter().all(|f| f.lines == vec!["offline"] && f.bg == color::OFFLINE));
+        assert!(
+            f.iter()
+                .all(|f| f.lines == vec!["offline"] && f.bg == color::OFFLINE)
+        );
     }
 
     #[test]
-    fn active_と_フェード先と_エラーの色() {
+    fn 文字の表示_active_とフェード先とエラー() {
         let mut s = state(3);
-        s.active = "s00".into();
         s.fade.fading = true;
-        s.fade.target = "s01".into();
+        s.fade.target = "s02".into();
         s.last_error = Some(LastError {
-            shader: "s02".into(),
+            shader: "s03".into(),
             message: "x".into(),
         });
-        let f = faces(Some(&s), 0, Mode::Fade);
-        assert_eq!(f[0].bg, color::ACTIVE);
-        assert_eq!(f[1].bg, color::TARGET);
-        assert_eq!(f[2].bg, color::SHADER);
+        let slots = [slot("s01"), slot("s02"), slot("s03")];
+        let f = faces(Some(&s), &slots, Mode::Fade, false);
+        assert_eq!(f[0].frame, Some(color::ACTIVE));
+        assert_eq!(f[0].lines, vec!["s01"]);
+        assert_eq!(f[0].badge.as_deref(), Some("1"));
+        assert_eq!(f[1].frame, Some(color::TARGET));
         assert_eq!(f[2].frame, Some(color::ERROR));
-        assert_eq!(f[2].lines, vec!["s02", "ERR"]);
-        assert_eq!(f[3].lines, Vec::<String>::new());
-        assert_eq!(f[3].bg, color::BLACK);
+        assert_eq!(f[2].lines, vec!["s03", "ERR"]);
+        // スロット 4（idx 5）は空
+        assert!(f[5].lines.is_empty());
+        assert_eq!(f[5].badge.as_deref(), Some("4"));
+        assert_eq!(f[5].bg, color::BLACK);
     }
 
     #[test]
-    fn フェードしていなければ_target_は色を付けない() {
+    fn フェードしていなければ_target_は印を付けない() {
         let mut s = state(2);
-        s.fade.target = "s01".into();
-        let f = faces(Some(&s), 0, Mode::Fade);
-        assert_eq!(f[1].bg, color::SHADER);
+        s.fade.target = "s02".into();
+        let f = faces(Some(&s), &[slot("s01"), slot("s02")], Mode::Fade, false);
+        assert_eq!(f[1].frame, None);
     }
 
     #[test]
-    fn 二ページ目() {
-        let s = state(12);
-        let f = faces(Some(&s), 1, Mode::Fade);
-        assert_eq!(f[0].lines, vec!["s10"]);
-        assert_eq!(f[1].lines, vec!["s11"]);
-        assert!(f[2].lines.is_empty());
-        assert_eq!(f[KEY_PREV].lines, vec!["<", "PAGE", "2/2"]);
-        assert_eq!(f[KEY_NEXT].fg, color::WHITE);
+    fn プレビューは画像に番号と枠を重ねる() {
+        let s = state(2);
+        let slots = [
+            Some(Slot {
+                name: "s01".into(),
+                image: Some(img()),
+                compile_error: false,
+            }),
+            Some(Slot {
+                name: "s02".into(),
+                image: None,
+                compile_error: true,
+            }),
+        ];
+        let f = faces(Some(&s), &slots, Mode::Fade, true);
+        assert!(f[0].image.is_some());
+        assert_eq!(f[0].frame, Some(color::ACTIVE));
+        assert!(f[0].lines.is_empty());
+        assert_eq!(f[0].badge.as_deref(), Some("1"));
+        // コンパイル失敗（jpeg が null）は名前と ERR
+        assert!(f[1].image.is_none());
+        assert_eq!(f[1].frame, Some(color::ERROR));
+        assert_eq!(f[1].lines, vec!["s02", "ERR"]);
     }
 
     #[test]
-    fn 一ページだけならページ送りは暗く() {
-        let f = faces(Some(&state(3)), 0, Mode::Fade);
-        assert_eq!(f[KEY_PREV].fg, color::DIM);
-        assert_eq!(f[KEY_NEXT].lines, vec![">", "PAGE", "1/1"]);
+    fn 同じ画像なら同じ_face() {
+        let s = state(1);
+        let a = faces(
+            Some(&s),
+            &[Some(Slot {
+                name: "s01".into(),
+                image: Some(img()),
+                compile_error: false,
+            })],
+            Mode::Fade,
+            true,
+        );
+        let b = faces(
+            Some(&s),
+            &[Some(Slot {
+                name: "s01".into(),
+                image: Some(img()),
+                compile_error: false,
+            })],
+            Mode::Fade,
+            true,
+        );
+        assert_eq!(a[0], b[0]);
+    }
+
+    #[test]
+    fn keys_が無ければ_0_と括弧は灰色() {
+        let s = state(1);
+        let off = faces(Some(&s), &[], Mode::Fade, false);
+        let on = faces(Some(&s), &[], Mode::Fade, true);
+        for k in [KEY_BACK, KEY_BEAT_DOWN, KEY_BEAT_UP] {
+            assert_eq!(off[k].bg, color::DISABLED);
+            assert_eq!(off[k].fg, color::DIM);
+            assert_eq!(on[k].bg, color::NAV);
+        }
+        assert_eq!(on[KEY_BEAT_DOWN].lines, vec!["[", "BEAT-"]);
+        assert_eq!(on[KEY_BEAT_UP].lines, vec!["]", "BEAT+"]);
+        assert_eq!(on[KEY_BACK].lines, vec!["0", "BACK"]);
     }
 
     #[test]
     fn タップは_bpm_と測定の有無() {
         let mut s = state(1);
-        let f = faces(Some(&s), 0, Mode::Fade);
+        let f = faces(Some(&s), &[], Mode::Fade, true);
         assert_eq!(f[KEY_TAP].lines, vec!["TAP", "120.0"]);
         assert_eq!(f[KEY_TAP].bg, color::TAP_DEFAULT);
         s.bpm = 128.25;
         s.bpm_measured = true;
-        let f = faces(Some(&s), 0, Mode::Fade);
+        let f = faces(Some(&s), &[], Mode::Fade, true);
         assert_eq!(f[KEY_TAP].lines, vec!["TAP", "128.2"]);
         assert_eq!(f[KEY_TAP].bg, color::TAP_MEASURED);
     }
@@ -310,10 +401,16 @@ mod tests {
     #[test]
     fn 方式のキー() {
         let mut s = state(1);
-        assert_eq!(faces(Some(&s), 0, Mode::Fade)[KEY_MODE].lines, vec!["FADE", "4 beat"]);
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_MODE].lines,
+            vec!["FADE", "4 beat"]
+        );
         s.fade.beats = 0.5;
-        assert_eq!(faces(Some(&s), 0, Mode::Fade)[KEY_MODE].lines, vec!["FADE", "0.5 beat"]);
-        let f = faces(Some(&s), 0, Mode::Cut);
+        assert_eq!(
+            faces(Some(&s), &[], Mode::Fade, true)[KEY_MODE].lines,
+            vec!["FADE", "0.5 beat"]
+        );
+        let f = faces(Some(&s), &[], Mode::Cut, true);
         assert_eq!(f[KEY_MODE].lines, vec!["CUT"]);
         assert_eq!(f[KEY_MODE].bg, color::MODE_CUT);
     }
@@ -321,11 +418,11 @@ mod tests {
     #[test]
     fn 状態のキー() {
         let mut s = state(1);
-        let f = faces(Some(&s), 0, Mode::Fade);
+        let f = faces(Some(&s), &[], Mode::Fade, true);
         assert_eq!(f[KEY_STATUS].lines, vec!["ON", "60fps"]);
         assert_eq!(f[KEY_STATUS].bg, color::STATUS_OK);
         s.last_error = Some(LastError::default());
-        let f = faces(Some(&s), 0, Mode::Fade);
+        let f = faces(Some(&s), &[], Mode::Fade, true);
         assert_eq!(f[KEY_STATUS].lines, vec!["ON", "60fps", "ERR"]);
         assert_eq!(f[KEY_STATUS].bg, color::STATUS_ERR);
     }

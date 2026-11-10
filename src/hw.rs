@@ -5,8 +5,10 @@ use crate::render::SIZE;
 use crate::runner::Opener;
 use elgato_streamdeck::images::convert_image_with_format;
 use elgato_streamdeck::info::ImageFormat;
+use elgato_streamdeck::{
+    StreamDeck, StreamDeckInput, list_devices, new_hidapi, refresh_device_list,
+};
 use hidapi::HidApi;
-use elgato_streamdeck::{StreamDeck, StreamDeckInput, list_devices, new_hidapi, refresh_device_list};
 use image::{DynamicImage, RgbImage};
 use std::time::Duration;
 
@@ -75,7 +77,6 @@ struct HwDeck {
     sd: StreamDeck,
     format: ImageFormat,
 }
-
 
 impl Deck for HwDeck {
     fn set_image(&mut self, key: u8, rgb: &[u8]) -> Result<(), String> {

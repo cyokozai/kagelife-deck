@@ -35,7 +35,12 @@ fn main() {
     }
     let app = app::App::new(api::HttpControl::new(path));
     let poll_every = Duration::from_secs_f64(1.0 / args.poll_hz);
-    let mut r = runner::Runner::new(app, hw::HwOpener::new(args.brightness), poll_every, SCAN_EVERY);
+    let mut r = runner::Runner::new(
+        app,
+        hw::HwOpener::new(args.brightness),
+        poll_every,
+        SCAN_EVERY,
+    );
     loop {
         r.turn();
     }

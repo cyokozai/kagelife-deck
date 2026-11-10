@@ -1,6 +1,7 @@
 //! kagelife の制御口 v1（ADR-006）のクライアント。
 //!
-//! 使うのは GET /v1/state・POST /v1/switch・POST /v1/crossfade・POST /v1/bpm だけ。
+//! 使うのは GET /v1/state・POST /v1/switch・POST /v1/crossfade・POST /v1/bpm と、
+//! 任意機能の GET /v1/previews（`previews`）・POST /v1/keys（`keys`）。
 //! 要求本文には契約のフィールドしか入れない（補足 19: 知らないフィールドは 400 になる）。
 //! 応答の知らないフィールドは無視する（deny_unknown_fields を付けない）。
 
@@ -26,10 +27,51 @@ pub struct State {
     pub fps: f64,
     #[serde(default)]
     pub last_error: Option<LastError>,
+    /// 任意機能の名前（補足 20）。`previews`・`keys` があれば使う
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl State {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
 }
 
 fn default_bpm() -> f64 {
     120.0
+}
+
+/// 任意機能 `previews` の名前。
+pub const FEATURE_PREVIEWS: &str = "previews";
+/// 任意機能 `keys` の名前。
+pub const FEATURE_KEYS: &str = "keys";
+
+/// GET /v1/previews の応答。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct Previews {
+    #[serde(default)]
+    pub size: u32,
+    #[serde(default)]
+    pub fps: f64,
+    #[serde(default)]
+    pub frame: u64,
+    #[serde(default)]
+    pub keys: Vec<PreviewKey>,
+}
+
+/// previews の keys の 1 つ。key は "1"〜"9"。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct PreviewKey {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub name: String,
+    /// base64 の JPEG。まだ描いていない・コンパイルに失敗したスロットでは null
+    #[serde(default)]
+    pub jpeg: Option<String>,
+    #[serde(default)]
+    pub compile_error: bool,
 }
 
 /// state の fade。
@@ -90,6 +132,10 @@ pub trait Control {
     /// beats は送らない（kagelife の現在のプリセットを使う）
     fn crossfade(&mut self, name: &str) -> Result<(), ApiError>;
     fn set_bpm(&mut self, bpm: f64) -> Result<(), ApiError>;
+    /// GET /v1/previews（feature `previews`）
+    fn previews(&mut self) -> Result<Previews, ApiError>;
+    /// POST /v1/keys（feature `keys`）。shift が None なら送らない
+    fn key(&mut self, key: &str, shift: Option<bool>) -> Result<(), ApiError>;
 }
 
 /// 1 回の要求の待ち時間の上限。kagelife の loop_timeout（2 秒）より少し長くする。
@@ -158,7 +204,12 @@ impl HttpControl {
     }
 
     /// 要求を送る。接続の失敗・401 のときは発見ファイルを読み直し、中身が変わっていれば 1 回だけ送り直す。
-    fn request(&mut self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, ApiError> {
+    fn request(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<Vec<u8>, ApiError> {
         let mut d = match self.disc.take() {
             Some(d) => d,
             None => self.load()?,
@@ -227,6 +278,21 @@ impl Control for HttpControl {
     fn set_bpm(&mut self, bpm: f64) -> Result<(), ApiError> {
         let body = serde_json::json!({ "bpm": bpm }).to_string();
         self.request("POST", "/v1/bpm", Some(body.as_bytes()))
+            .map(|_| ())
+    }
+
+    fn previews(&mut self) -> Result<Previews, ApiError> {
+        let b = self.request("GET", "/v1/previews", None)?;
+        serde_json::from_slice(&b).map_err(|e| ApiError::Decode(e.to_string()))
+    }
+
+    fn key(&mut self, key: &str, shift: Option<bool>) -> Result<(), ApiError> {
+        let body = match shift {
+            Some(s) => serde_json::json!({ "key": key, "shift": s }),
+            None => serde_json::json!({ "key": key }),
+        }
+        .to_string();
+        self.request("POST", "/v1/keys", Some(body.as_bytes()))
             .map(|_| ())
     }
 }
@@ -310,7 +376,9 @@ mod tests {
             Self(p)
         }
         fn write(&self, addr: &str, token: &str) {
-            let j = format!(r#"{{"addr":"{addr}","token":"{token}","pid":1,"shader_dir":"/s","version":1}}"#);
+            let j = format!(
+                r#"{{"addr":"{addr}","token":"{token}","pid":1,"shader_dir":"/s","version":1}}"#
+            );
             std::fs::write(&self.0, j).unwrap();
         }
     }
@@ -379,10 +447,7 @@ mod tests {
 
     #[test]
     fn switch_と_bpm_の本文() {
-        let (addr, rx) = fake_server(vec![
-            (200, r#"{"active":"y"}"#),
-            (200, r#"{"bpm":128.0}"#),
-        ]);
+        let (addr, rx) = fake_server(vec![(200, r#"{"active":"y"}"#), (200, r#"{"bpm":128.0}"#)]);
         let f = TempFile::new("switch");
         f.write(&addr, "tok");
         let mut c = HttpControl::new(Some(f.0.clone()));
@@ -455,6 +520,81 @@ mod tests {
         let (live, _rx) = fake_server(vec![(200, r#"{"active":"z","shaders":["z"],"bpm":120}"#)]);
         f.write(&live, "t2");
         assert_eq!(c.state().unwrap().active, "z");
+    }
+
+    #[test]
+    fn state_の_features() {
+        let (addr, _rx) = fake_server(vec![(200, r#"{"features":["keys","previews"]}"#)]);
+        let f = TempFile::new("features");
+        f.write(&addr, "t");
+        let s = HttpControl::new(Some(f.0.clone())).state().unwrap();
+        assert!(s.has(FEATURE_PREVIEWS) && s.has(FEATURE_KEYS));
+        assert!(!State::default().has(FEATURE_KEYS));
+    }
+
+    #[test]
+    fn previews_を取る_jpeg_の_null_と知らないフィールド() {
+        let (addr, rx) = fake_server(vec![(
+            200,
+            r#"{"size":72,"fps":10,"frame":123,"extra":1,
+               "keys":[{"key":"1","name":"01_uv","jpeg":"QUJD","compile_error":false},
+                       {"key":"3","name":"03_bad","jpeg":null,"compile_error":true,"x":0}]}"#,
+        )]);
+        let f = TempFile::new("previews");
+        f.write(&addr, "tp");
+        let p = HttpControl::new(Some(f.0.clone())).previews().unwrap();
+        assert_eq!(p.frame, 123);
+        assert_eq!(p.keys.len(), 2);
+        assert_eq!(p.keys[0].jpeg.as_deref(), Some("QUJD"));
+        assert_eq!(p.keys[1].key, "3");
+        assert_eq!(p.keys[1].jpeg, None);
+        assert!(p.keys[1].compile_error);
+        let g = rx.recv().unwrap();
+        assert_eq!(
+            (g.method.as_str(), g.path.as_str()),
+            ("GET", "/v1/previews")
+        );
+        assert_eq!(g.auth.as_deref(), Some("Bearer tp"));
+    }
+
+    #[test]
+    fn keys_の本文_shift_は指定したときだけ() {
+        let (addr, rx) = fake_server(vec![(200, r#"{"key":"1"}"#), (200, r#"{"key":"["}"#)]);
+        let f = TempFile::new("keys");
+        f.write(&addr, "tk");
+        let mut c = HttpControl::new(Some(f.0.clone()));
+        c.key("1", Some(true)).unwrap();
+        c.key("[", None).unwrap();
+        let g = rx.recv().unwrap();
+        assert_eq!((g.method.as_str(), g.path.as_str()), ("POST", "/v1/keys"));
+        assert_eq!(g.auth.as_deref(), Some("Bearer tk"));
+        assert_eq!(body_json(&g), serde_json::json!({"key":"1","shift":true}));
+        assert_eq!(
+            body_json(&rx.recv().unwrap()),
+            serde_json::json!({"key":"["})
+        );
+    }
+
+    #[test]
+    fn keys_の_404_と_400_はエラーの中身を返し_offline_にしない() {
+        let (addr, _rx) = fake_server(vec![
+            (
+                404,
+                r#"{"error":"not_found","message":"no shader on key 7"}"#,
+            ),
+            (400, r#"{"error":"invalid_key","message":"bad"}"#),
+        ]);
+        let f = TempFile::new("keys-err");
+        f.write(&addr, "t");
+        let mut c = HttpControl::new(Some(f.0.clone()));
+        assert!(matches!(
+            c.key("7", Some(false)),
+            Err(ApiError::Status { code: 404, ref error, .. }) if error == "not_found"
+        ));
+        assert!(matches!(
+            c.key("x", None),
+            Err(ApiError::Status { code: 400, ref error, .. }) if error == "invalid_key"
+        ));
     }
 
     #[test]

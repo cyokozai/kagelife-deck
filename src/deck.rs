@@ -87,6 +87,8 @@ mod tests {
             fg: color::WHITE,
             frame: None,
             lines: vec![t.into()],
+            badge: None,
+            image: None,
         }
     }
 
@@ -148,7 +150,10 @@ mod tests {
         assert_eq!(pressed_edges(&mut prev, &[false, true, false]), vec![1]);
         // 押しっぱなしは拾わない。離して押し直したら拾う
         assert_eq!(pressed_edges(&mut prev, &[false, true, true]), vec![2]);
-        assert_eq!(pressed_edges(&mut prev, &[false, false, true]), Vec::<usize>::new());
+        assert_eq!(
+            pressed_edges(&mut prev, &[false, false, true]),
+            Vec::<usize>::new()
+        );
         assert_eq!(pressed_edges(&mut prev, &[false, true, true]), vec![1]);
     }
 

@@ -2,10 +2,13 @@
 
 use crate::view::{Face, Rgb};
 use embedded_graphics::{
-    mono_font::{MonoTextStyle, ascii::FONT_7X14},
+    mono_font::{
+        MonoTextStyle,
+        ascii::{FONT_6X10, FONT_7X14},
+    },
     pixelcolor::Rgb888,
     prelude::*,
-    primitives::{PrimitiveStyleBuilder, Rectangle, StrokeAlignment},
+    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use std::convert::Infallible;
@@ -16,6 +19,9 @@ pub const SIZE: usize = 72;
 const LINE_H: i32 = 14;
 /// エラーの縁取りの太さ。
 const FRAME: u32 = 4;
+/// 番号の字幅と、黒地の高さ（FONT_6X10）。
+const BADGE_CHAR_W: u32 = 6;
+const BADGE_H: u32 = 12;
 
 /// RGB の画素を並べた画面。
 struct Canvas {
@@ -54,7 +60,10 @@ fn rgb(c: Rgb) -> Rgb888 {
 pub fn render(face: &Face) -> Vec<u8> {
     let Rgb(r, g, b) = face.bg;
     let mut c = Canvas {
-        buf: [r, g, b].repeat(SIZE * SIZE),
+        buf: match &face.image {
+            Some(img) if img.len() == SIZE * SIZE * 3 => img.to_vec(),
+            _ => [r, g, b].repeat(SIZE * SIZE),
+        },
     };
 
     if let Some(fc) = face.frame {
@@ -80,6 +89,16 @@ pub fn render(face: &Face) -> Vec<u8> {
         let p = Point::new(SIZE as i32 / 2, top + LINE_H * i as i32);
         let _ = Text::with_text_style(line, p, text_style, layout).draw(&mut c);
     }
+
+    // 数字キーの番号は左上に、黒地に小さく
+    if let Some(badge) = &face.badge {
+        let w = BADGE_CHAR_W * badge.chars().count() as u32 + 3;
+        let _ = Rectangle::new(Point::zero(), Size::new(w, BADGE_H))
+            .into_styled(PrimitiveStyle::with_fill(Rgb888::BLACK))
+            .draw(&mut c);
+        let style = MonoTextStyle::new(&FONT_6X10, Rgb888::WHITE);
+        let _ = Text::with_baseline(badge, Point::new(2, 1), style, Baseline::Top).draw(&mut c);
+    }
     c.buf
 }
 
@@ -99,6 +118,8 @@ mod tests {
             fg: color::WHITE,
             frame,
             lines: lines.iter().map(|s| s.to_string()).collect(),
+            badge: None,
+            image: None,
         }
     }
 
@@ -106,7 +127,8 @@ mod tests {
     fn 大きさと背景() {
         let b = render(&face(&[], None));
         assert_eq!(b.len(), SIZE * SIZE * 3);
-        assert!(b.chunks(3).all(|p| p == [0, 110, 50]));
+        let Rgb(r, g, bl) = color::ACTIVE;
+        assert!(b.chunks(3).all(|p| p == [r, g, bl]));
     }
 
     #[test]
@@ -133,6 +155,23 @@ mod tests {
         // 最上段と最下段の行（1px の余白）は背景
         assert!((0..SIZE).all(|x| px(&b, x, 0) == color::ACTIVE));
         assert!((0..SIZE).all(|x| px(&b, x, 71) == color::ACTIVE));
+    }
+
+    #[test]
+    fn プレビューを敷いて番号を重ねる() {
+        let mut f = face(&[], Some(color::ACTIVE));
+        f.image = Some(vec![10u8; SIZE * SIZE * 3].into());
+        f.badge = Some("7".into());
+        let b = render(&f);
+        // 中央はプレビュー、縁は枠、左上は番号の黒地（枠より後に描く）
+        assert_eq!(px(&b, 36, 36), Rgb(10, 10, 10));
+        assert_eq!(px(&b, 71, 36), color::ACTIVE);
+        assert_eq!(px(&b, 0, 0), color::BLACK);
+        let white = (0..12)
+            .flat_map(|y| (0..9).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(&b, x, y) == Rgb(255, 255, 255))
+            .count();
+        assert!(white > 5, "番号が描かれていない: {white}");
     }
 
     #[test]

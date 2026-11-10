@@ -54,10 +54,7 @@ impl std::fmt::Display for DiscoveryError {
 ///    無ければ `$HOME/.cache`。その下の `kagelife/control.json`
 ///
 /// どれも決まらなければ None。env は環境変数の読み出し（テストで差し替える）。
-pub fn resolve_path(
-    arg: Option<&Path>,
-    env: impl Fn(&str) -> Option<OsString>,
-) -> Option<PathBuf> {
+pub fn resolve_path(arg: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     if let Some(p) = arg {
         return Some(p.to_path_buf());
     }
@@ -132,7 +129,10 @@ mod tests {
                 ("HOME", "/home/u"),
             ]),
         );
-        assert_eq!(p, Some(PathBuf::from("/home/u/.cache/kagelife/control.json")));
+        assert_eq!(
+            p,
+            Some(PathBuf::from("/home/u/.cache/kagelife/control.json"))
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! 1 巡でやること:
 //! 1. デバイスが無く、探す時刻になっていれば探す
-//! 2. state を取り直す時刻になっていれば取り直す
+//! 2. state を取り直す時刻になっていれば取り直す（kagelife が previews を持てば、プレビューも 10 Hz で取る）
 //! 3. 描画内容が変わったキーだけを送る
 //! 4. 次の時刻までデバイスの入力を待つ（デバイスが無ければ sleep）。押されたら処理して、すぐ state を取り直す
 
@@ -13,6 +13,9 @@ use crate::render::render;
 use std::time::{Duration, Instant};
 
 /// デバイスを開く。見つからなければ None。
+/// プレビューを取る間隔（kagelife の描く上限と同じ 10 fps）。
+pub const PREVIEW_EVERY: Duration = Duration::from_millis(100);
+
 pub trait Opener {
     fn open(&mut self) -> Option<Box<dyn Deck>>;
 }
@@ -25,8 +28,10 @@ pub struct Runner<C: Control, O: Opener> {
     buttons: Vec<bool>,
     poll_every: Duration,
     scan_every: Duration,
+    preview_every: Duration,
     next_poll: Instant,
     next_scan: Instant,
+    next_preview: Instant,
 }
 
 impl<C: Control, O: Opener> Runner<C, O> {
@@ -40,11 +45,14 @@ impl<C: Control, O: Opener> Runner<C, O> {
             buttons: Vec::new(),
             poll_every,
             scan_every,
+            preview_every: PREVIEW_EVERY,
             next_poll: now,
             next_scan: now,
+            next_preview: now,
         }
     }
 
+    #[cfg(test)]
     pub fn has_deck(&self) -> bool {
         self.deck.is_some()
     }
@@ -70,16 +78,24 @@ impl<C: Control, O: Opener> Runner<C, O> {
             self.app.poll();
             self.next_poll = Instant::now() + self.poll_every;
         }
+        let previews = self.app.wants_previews();
+        if previews && Instant::now() >= self.next_preview {
+            self.app.poll_previews();
+            self.next_preview = Instant::now() + self.preview_every;
+        }
         if let Some(d) = self.deck.as_mut()
             && let Err(e) = sync_keys(d.as_mut(), &mut self.cache, &self.app.faces(), render)
         {
             self.drop_deck(&e);
         }
 
-        let deadline = match self.deck {
-            Some(_) => self.next_poll,
-            None => self.next_poll.min(self.next_scan),
-        };
+        let mut deadline = self.next_poll;
+        if previews {
+            deadline = deadline.min(self.next_preview);
+        }
+        if self.deck.is_none() {
+            deadline = deadline.min(self.next_scan);
+        }
         let wait = deadline.saturating_duration_since(Instant::now());
         let Some(d) = self.deck.as_mut() else {
             std::thread::sleep(wait);
@@ -90,6 +106,7 @@ impl<C: Control, O: Opener> Runner<C, O> {
                 for k in pressed_edges(&mut self.buttons, &state) {
                     if self.app.press(k, Instant::now()) {
                         self.next_poll = Instant::now();
+                        self.next_preview = Instant::now();
                     }
                 }
             }
@@ -102,7 +119,7 @@ impl<C: Control, O: Opener> Runner<C, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{ApiError, State};
+    use crate::api::{ApiError, PreviewKey, Previews, State};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -112,6 +129,7 @@ mod tests {
         calls: Vec<String>,
         sent: Vec<u8>,
         opens: usize,
+        frame: u64,
     }
     type Shared = Rc<RefCell<Log>>;
 
@@ -134,6 +152,28 @@ mod tests {
         }
         fn set_bpm(&mut self, b: f64) -> Result<(), ApiError> {
             self.log.borrow_mut().calls.push(format!("bpm {b}"));
+            Ok(())
+        }
+        fn previews(&mut self) -> Result<Previews, ApiError> {
+            let mut l = self.log.borrow_mut();
+            l.calls.push("previews".into());
+            l.frame += 1;
+            Ok(Previews {
+                frame: l.frame,
+                keys: vec![PreviewKey {
+                    key: "1".into(),
+                    name: "a".into(),
+                    jpeg: Some(crate::app::tests::jpeg_b64([0, 0, (l.frame * 40) as u8])),
+                    compile_error: false,
+                }],
+                ..Default::default()
+            })
+        }
+        fn key(&mut self, k: &str, shift: Option<bool>) -> Result<(), ApiError> {
+            self.log
+                .borrow_mut()
+                .calls
+                .push(format!("key {k} {shift:?}"));
             Ok(())
         }
     }
@@ -222,7 +262,10 @@ mod tests {
 
     #[test]
     fn 押したら操作して_すぐ取り直す() {
-        let (mut r, log) = setup(vec![vec![Ok(Some(keys(&[1]))), Ok(Some(keys(&[])))]], online());
+        let (mut r, log) = setup(
+            vec![vec![Ok(Some(keys(&[1]))), Ok(Some(keys(&[])))]],
+            online(),
+        );
         r.turn(); // 開く・取る・送る・押下を読む → crossfade b
         assert_eq!(log.borrow().calls, vec!["state", "crossfade b"]);
         r.turn(); // 押下の直後なので取り直す
@@ -230,12 +273,12 @@ mod tests {
     }
 
     #[test]
-    fn ページ送りは描き直すだけ() {
-        let (mut r, log) = setup(vec![vec![Ok(Some(keys(&[11])))]], online());
+    fn 方式の切替は描き直すだけ() {
+        let (mut r, log) = setup(vec![vec![Ok(Some(keys(&[8])))]], online());
         r.turn();
         r.turn();
-        // 1 ページしかないので表示は変わらない（送り直さない）
-        assert_eq!(log.borrow().sent.len(), 15);
+        // 方式のキー（idx 8）だけ送り直し、制御口は呼ばない
+        assert_eq!(&log.borrow().sent[15..], &[8]);
         assert_eq!(log.borrow().calls, vec!["state"]);
     }
 
@@ -270,6 +313,30 @@ mod tests {
         r.turn();
         // シェーダ 2 個・空き 8 個・下段 5 個。offline から変わったキーはすべて送る
         assert_eq!(log.borrow().sent.len(), 30);
+    }
+
+    #[test]
+    fn previews_があれば取りに行き_変わったスロットだけ送る() {
+        let mut s = online().unwrap();
+        s.features = vec!["previews".into(), "keys".into()];
+        let (mut r, log) = setup(vec![vec![]], Some(s));
+        r.preview_every = Duration::ZERO;
+        r.turn();
+        assert_eq!(log.borrow().calls, vec!["state", "previews"]);
+        assert_eq!(log.borrow().sent.len(), 15);
+        r.turn();
+        // frame が進み、スロット 1 の色が変わった → idx 0 だけ送る
+        assert_eq!(log.borrow().calls, vec!["state", "previews", "previews"]);
+        assert_eq!(&log.borrow().sent[15..], &[0]);
+    }
+
+    #[test]
+    fn previews_が無ければ取りに行かない() {
+        let (mut r, log) = setup(vec![vec![]], online());
+        r.preview_every = Duration::ZERO;
+        r.turn();
+        r.turn();
+        assert_eq!(log.borrow().calls, vec!["state"]);
     }
 
     impl Runner<FakeCtl, FakeOpener> {
