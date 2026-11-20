@@ -150,6 +150,14 @@ const GET_TIMEOUT: Duration = Duration::from_secs(1);
 /// Err の文は offline の理由としてそのまま使う（トークンを入れない）。
 pub trait Locate {
     fn locate(&mut self) -> Result<Discovery, String>;
+
+    /// prev に送って失敗した直後に呼ぶ。新しい結果が出るのを少しだけ待ってよい
+    /// （ssh 越しのモードで、kagelife が起動し直した直後に押したキーを捨てないため）。
+    /// 既定では locate と同じ。
+    fn relocate(&mut self, prev: &Discovery) -> Result<Discovery, String> {
+        let _ = prev;
+        self.locate()
+    }
 }
 
 /// この機械の発見ファイルを読む。
@@ -259,7 +267,7 @@ impl HttpControl {
             };
             // kagelife が再起動してポートとトークンが変わったかもしれない
             if attempt == 0
-                && let Ok(fresh) = self.load()
+                && let Ok(fresh) = self.source.relocate(&d)
                 && fresh != d
             {
                 d = fresh;
@@ -732,6 +740,41 @@ mod tests {
         // 2 回目: 死んだ addr に送って失敗 → 聞き直すと変わっている → 送り直して通る
         assert_eq!(c.state().unwrap().active, "q");
         assert_eq!(*n.lock().unwrap(), 3);
+        assert_eq!(rx.recv().unwrap().auth.as_deref(), Some("Bearer t2"));
+    }
+
+    /// relocate に渡された前の addr を記録する発見。
+    struct RelocLocator {
+        first: Discovery,
+        then: Discovery,
+        prevs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Locate for RelocLocator {
+        fn locate(&mut self) -> Result<Discovery, String> {
+            Ok(self.first.clone())
+        }
+        fn relocate(&mut self, prev: &Discovery) -> Result<Discovery, String> {
+            self.prevs.lock().unwrap().push(prev.addr.clone());
+            Ok(self.then.clone())
+        }
+    }
+
+    #[test]
+    fn 失敗の直後は_relocate_で前の繋ぎ先を渡して聞き直す() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let (live, rx) = fake_server(vec![(200, r#"{"key":"1"}"#)]);
+        let prevs = std::sync::Arc::default();
+        let mut c = HttpControl::with_locator(Box::new(RelocLocator {
+            first: disc(&dead, "t1"),
+            then: disc(&live, "t2"),
+            prevs: std::sync::Arc::clone(&prevs),
+        }));
+        // 押したキーは 1 回の呼び出しで届く
+        c.key("1", None).unwrap();
+        assert_eq!(*prevs.lock().unwrap(), vec![dead]);
         assert_eq!(rx.recv().unwrap().auth.as_deref(), Some("Bearer t2"));
     }
 
