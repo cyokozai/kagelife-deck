@@ -1,0 +1,21 @@
+# systemd のユーザー単位のユニット。
+# 置き場所: ~/.config/systemd/user/kagelife-deck.service
+# 有効化: systemctl --user daemon-reload && systemctl --user enable --now kagelife-deck
+# ログ: journalctl --user -u kagelife-deck -f
+
+[Unit]
+Description=kagelife-deck (Stream Deck から kagelife を操作する)
+# 落ち続けても起動をやめない（既定の 10 秒に 5 回で止まる制限を外す）
+StartLimitIntervalSec=0
+
+[Service]
+# kagelife を KAGELIFE_CONTROL_FILE 付きで起動しているなら、同じ値をここにも書く
+#Environment=KAGELIFE_CONTROL_FILE=%h/.cache/kagelife/control.json
+ExecStart=%h/.local/bin/kagelife-deck
+Restart=on-failure
+RestartSec=2
+# 描画（kagelife）より後回しにする
+Nice=5
+
+[Install]
+WantedBy=default.target

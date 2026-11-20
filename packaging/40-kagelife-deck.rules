@@ -1,0 +1,11 @@
+# Elgato Stream Deck MK.2 を一般ユーザー（plugdev のメンバーとログイン中の利用者）が開けるようにする。
+# OpenActionAPI/rust-elgato-streamdeck の 40-streamdeck.rules を参考に、MK.2 の分だけを置いた。
+# 置き場所: /etc/udev/rules.d/40-kagelife-deck.rules
+# 反映: sudo udevadm control --reload-rules && sudo udevadm trigger（その後 Stream Deck を挿し直す）
+#
+# 0fd9 = Elgato、0080 = Stream Deck MK.2、00a5 = Stream Deck MK.2（Scissor Keys）
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0080", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0080", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="00a5", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="00a5", MODE="0660", GROUP="plugdev", TAG+="uaccess"
