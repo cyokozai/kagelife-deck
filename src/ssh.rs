@@ -12,9 +12,12 @@
 
 use crate::api::Locate;
 use crate::discovery::{self, Discovery, DiscoveryError};
-use std::net::SocketAddr;
+use std::io::Read;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 /// `--remote-control-file` の既定。相手のシェルが `~` を展開する。
@@ -111,12 +114,7 @@ pub struct Tunneler<E: SshExec> {
 }
 
 impl<E: SshExec> Tunneler<E> {
-    pub fn new(
-        exec: E,
-        host: &str,
-        remote_file: &str,
-        log: Box<dyn FnMut(String) + Send>,
-    ) -> Self {
+    pub fn new(exec: E, host: &str, remote_file: &str, log: Box<dyn FnMut(String) + Send>) -> Self {
         Self {
             exec,
             host: host.to_string(),
@@ -393,6 +391,295 @@ fn worker<E: SshExec>(
     }
 }
 
+/// 動いている ssh の子プロセスの登録簿。終了の合図・panic のときに全部止めるため（孤児の ssh を残さない）。
+pub struct Registry {
+    children: Mutex<Vec<(u64, Child)>>,
+    next: AtomicU64,
+}
+
+/// このプロセスの登録簿。
+pub static CHILDREN: Registry = Registry::new();
+
+impl Registry {
+    pub const fn new() -> Self {
+        Self {
+            children: Mutex::new(Vec::new()),
+            next: AtomicU64::new(1),
+        }
+    }
+
+    fn add(&self, c: Child) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        lock(&self.children).push((id, c));
+        id
+    }
+
+    /// None: 登録簿に無い（止めた・kill_all で止まった）。Some(None): 動いている。Some(Some(s)): 終わった
+    fn try_wait(&self, id: u64) -> Option<Option<ExitStatus>> {
+        let mut g = lock(&self.children);
+        let (_, c) = g.iter_mut().find(|(i, _)| *i == id)?;
+        Some(c.try_wait().ok().flatten())
+    }
+
+    /// 登録簿から外す。kill が真なら止めてから外す。
+    fn remove(&self, id: u64, kill: bool) {
+        let c = {
+            let mut g = lock(&self.children);
+            g.iter()
+                .position(|(i, _)| *i == id)
+                .map(|at| g.swap_remove(at).1)
+        };
+        if let Some(mut c) = c {
+            if kill {
+                let _ = c.kill();
+            }
+            let _ = c.wait();
+        }
+    }
+
+    /// 登録した子プロセスを全部止める。block が偽なら、ロックが取れないとき何もしない（panic の中で使う）。
+    pub fn kill_all(&self, block: bool) {
+        let mut g = if block {
+            lock(&self.children)
+        } else {
+            match self.children.try_lock() {
+                Ok(g) => g,
+                Err(TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(TryLockError::WouldBlock) => return,
+            }
+        };
+        for (_, mut c) in g.drain(..) {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock(&self.children).len()
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// cmd を走らせ、limit 以内に終われば標準出力を返す。終わらなければ止めてエラーにする。
+/// エラー文には標準エラーだけを入れる（標準出力にはトークンが入るため）。
+pub fn run_limited(reg: &Registry, mut cmd: Command, limit: Duration) -> Result<Vec<u8>, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("起動できない: {e}"))?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut b);
+            }
+            b
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let id = reg.add(child);
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match reg.try_wait(id) {
+            None => return Err("止められた".into()),
+            Some(Some(s)) => break s,
+            Some(None) if Instant::now() >= deadline => {
+                reg.remove(id, true);
+                // 読み手のスレッドは待たない（孫のプロセスがパイプを持ったままのことがある）
+                return Err(format!("{limit:?} 以内に終わらない"));
+            }
+            Some(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    reg.remove(id, false);
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    if status.success() {
+        return Ok(out);
+    }
+    let msg = String::from_utf8_lossy(&err);
+    let msg = msg.trim();
+    // 長いときは末尾だけ
+    let msg: String = {
+        let n = msg.chars().count();
+        msg.chars().skip(n.saturating_sub(300)).collect()
+    };
+    if msg.is_empty() {
+        Err(format!("{status} で終わった"))
+    } else {
+        Err(format!("{status} で終わった: {msg}"))
+    }
+}
+
+/// 本物の ssh を走らせる。
+pub struct SystemSsh {
+    program: String,
+    reg: &'static Registry,
+}
+
+impl SystemSsh {
+    pub fn new() -> Self {
+        Self::with_program("ssh", &CHILDREN)
+    }
+
+    /// 走らせるプログラムと登録簿を選ぶ（テスト用）。
+    pub fn with_program(program: &str, reg: &'static Registry) -> Self {
+        Self {
+            program: program.to_string(),
+            reg,
+        }
+    }
+}
+
+impl Default for SystemSsh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 登録簿に載せたトンネルの子プロセス。
+struct RegisteredProc {
+    reg: &'static Registry,
+    id: u64,
+}
+
+impl TunnelProc for RegisteredProc {
+    fn alive(&mut self) -> bool {
+        match self.reg.try_wait(self.id) {
+            Some(None) => true,
+            Some(Some(_)) => {
+                self.reg.remove(self.id, false);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.reg.remove(self.id, true);
+    }
+}
+
+impl SshExec for SystemSsh {
+    fn read(&mut self, args: &[String]) -> Result<Vec<u8>, String> {
+        let mut c = Command::new(&self.program);
+        c.args(args);
+        run_limited(self.reg, c, READ_LIMIT)
+    }
+
+    fn spawn(&mut self, args: &[String]) -> Result<Box<dyn TunnelProc>, String> {
+        let child = Command::new(&self.program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            // ssh の警告（転送の失敗など）はこのプロセスの標準エラーにそのまま出す
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let id = self.reg.add(child);
+        Ok(Box::new(RegisteredProc { reg: self.reg, id }))
+    }
+
+    fn free_port(&mut self) -> Result<u16, String> {
+        let l = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+        Ok(l.local_addr().map_err(|e| e.to_string())?.port())
+    }
+
+    fn ready(&mut self, port: u16) -> bool {
+        let a = SocketAddr::from(([127, 0, 0, 1], port));
+        TcpStream::connect_timeout(&a, Duration::from_millis(200)).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod system_tests {
+    //! 本物の子プロセスを使うテスト（ssh の代わりに sh・sleep を走らせる）。
+    use super::*;
+    use std::process::Command;
+
+    fn sh(script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        c
+    }
+
+    #[test]
+    fn 期限付きの実行は標準出力を返す() {
+        let r = Registry::new();
+        let out = run_limited(&r, sh("printf hello"), Duration::from_secs(5)).unwrap();
+        assert_eq!(out, b"hello");
+        assert_eq!(r.len(), 0, "終わった子プロセスは登録簿から外す");
+    }
+
+    #[test]
+    fn 失敗の文には標準エラーを入れ_標準出力は入れない() {
+        let r = Registry::new();
+        let e = run_limited(
+            &r,
+            sh("printf SECRET-out; echo boom >&2; exit 3"),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.contains("boom"), "{e}");
+        assert!(!e.contains("SECRET-out"), "{e}");
+    }
+
+    #[test]
+    fn 期限を過ぎたら止めてエラーにする() {
+        let r = Registry::new();
+        let t = Instant::now();
+        let e = run_limited(&r, sh("sleep 5"), Duration::from_millis(200)).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(!e.is_empty());
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn 子プロセスは止めれば死に_kill_all_で全部止まる() {
+        let r: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let mut ex = SystemSsh::with_program("sleep", r);
+        let mut a = ex.spawn(&["30".to_string()]).unwrap();
+        let mut b = ex.spawn(&["30".to_string()]).unwrap();
+        assert!(a.alive() && b.alive());
+        assert_eq!(r.len(), 2);
+        a.stop();
+        assert!(!a.alive());
+        assert_eq!(r.len(), 1);
+        r.kill_all(true);
+        assert!(!b.alive());
+        assert_eq!(r.len(), 0);
+        b.stop(); // 2 度目でも困らない
+    }
+
+    #[test]
+    fn 空きポートと繋がるかの確かめ() {
+        let r: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let mut ex = SystemSsh::with_program("ssh", r);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(ex.ready(l.local_addr().unwrap().port()));
+        let p = ex.free_port().unwrap();
+        assert_ne!(p, 0);
+        assert!(!ex.ready(p));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,7 +839,10 @@ mod tests {
         assert_eq!(d.token, TOKEN);
         let l = log.lock().unwrap();
         assert_eq!(l.reads, vec![cat_args("pc01", DEFAULT_REMOTE_FILE)]);
-        assert_eq!(l.spawns, vec![forward_args("pc01", 50001, "127.0.0.1:43210")]);
+        assert_eq!(
+            l.spawns,
+            vec![forward_args("pc01", 50001, "127.0.0.1:43210")]
+        );
     }
 
     #[test]
@@ -640,7 +930,12 @@ mod tests {
         let mut errors = Vec::new();
         for i in 0..6 {
             if i == 5 {
-                log.lock().unwrap().alive.last().unwrap().store(false, Ordering::SeqCst);
+                log.lock()
+                    .unwrap()
+                    .alive
+                    .last()
+                    .unwrap()
+                    .store(false, Ordering::SeqCst);
                 assert!(t.tunnel_dead());
             }
             match t.refresh() {
@@ -723,7 +1018,10 @@ mod tests {
                 {
                     return d;
                 }
-                assert!(start.elapsed() < Duration::from_secs(3), "{addr} にならない");
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "{addr} にならない"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
         };

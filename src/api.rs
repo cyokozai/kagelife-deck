@@ -686,7 +686,10 @@ mod tests {
     }
 
     /// 呼ばれるたびに次の結果を返す発見（尽きたら最後のものを返し続ける）。
-    struct SeqLocator(Vec<Result<Discovery, String>>, std::sync::Arc<std::sync::Mutex<usize>>);
+    struct SeqLocator(
+        Vec<Result<Discovery, String>>,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+    );
     impl Locate for SeqLocator {
         fn locate(&mut self) -> Result<Discovery, String> {
             *self.1.lock().unwrap() += 1;
@@ -717,7 +720,11 @@ mod tests {
         let (live, rx) = fake_server(vec![(200, r#"{"active":"q"}"#)]);
         let n = std::sync::Arc::new(std::sync::Mutex::new(0));
         let mut c = HttpControl::with_locator(Box::new(SeqLocator(
-            vec![Err("準備中".into()), Ok(disc(&dead, "t1")), Ok(disc(&live, "t2"))],
+            vec![
+                Err("準備中".into()),
+                Ok(disc(&dead, "t1")),
+                Ok(disc(&live, "t2")),
+            ],
             n.clone(),
         )));
         // 1 回目: 発見がまだ無い → offline（その文をそのまま返す）
