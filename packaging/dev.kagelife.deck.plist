@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS の launchd のユーザー単位のエージェント（雛形）。
+  置き場所: ~/Library/LaunchAgents/dev.kagelife.deck.plist
+  USERNAME を自分のユーザー名に、pc01 を kagelife が動く機械の ssh の宛先に書き換える。
+  kagelife が同じ Mac で動くなら、ProgramArguments の 2・3 行目（"--ssh" と "pc01"）を消す。
+  launchd は ~ を展開しないので、パスはすべて絶対パスで書く。
+  読み込み: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kagelife.deck.plist
+  止める:   launchctl bootout gui/$(id -u)/dev.kagelife.deck
+  止めると SIGTERM が届き、kagelife-deck はトンネルの ssh を止めてから終わる。
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.kagelife.deck</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/.local/bin/kagelife-deck</string>
+    <string>--ssh</string>
+    <string>pc01</string>
+  </array>
+  <!-- ログインしたら起動し、落ちたら起動し直す -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- 起動し直す間隔の下限（秒） -->
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <!-- 描画より後回しにする -->
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/Library/Logs/kagelife-deck.log</string>
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/Library/Logs/kagelife-deck.log</string>
+</dict>
+</plist>

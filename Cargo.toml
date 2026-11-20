@@ -2,7 +2,7 @@
 name = "kagelife-deck"
 version = "0.1.0"
 edition = "2024"
-description = "Stream Deck MK.2 から kagelife の制御口 v1 を操作する常駐アプリ（Linux）"
+description = "Stream Deck MK.2 から kagelife の制御口 v1 を操作する常駐アプリ"
 publish = false
 
 [dependencies]
@@ -19,6 +19,8 @@ embedded-graphics = "0.8.2"
 # HTTP は平文の 127.0.0.1 だけなので TLS・gzip を外す
 ureq = { version = "3.5.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
+# ssh 越しのモードで、SIGINT・SIGTERM・SIGHUP を受けたときにトンネルの ssh を止めてから終わる
+ctrlc = { version = "3.4", features = ["termination"] }
 serde_json = "1"
 
 [dev-dependencies]
