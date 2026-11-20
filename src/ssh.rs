@@ -1240,7 +1240,7 @@ mod tests {
         // kagelife が落ちた。主ループは失敗のたびに locate を呼ぶ（0.5 秒ごとの代わりに 50ms ごと）
         let reads0 = log.lock().unwrap().reads.len();
         let start = Instant::now();
-        while start.elapsed() < ms(1000) {
+        while start.elapsed() < ms(2000) {
             assert!(
                 loc.locate().is_ok(),
                 "トンネルは生きているので current は残る"
@@ -1248,16 +1248,18 @@ mod tests {
             std::thread::sleep(ms(50));
         }
         let stale_reads = log.lock().unwrap().reads.len() - reads0;
-        // 倍々にしないので 1 秒で 100ms ごとに 10 回前後。詰めて呼んでもいない
+        // 一定の間隔なら 2 秒で 100ms ごとに 20 回前後（macOS の CI のように時刻の刻みが粗いと 6 割ほどに減る）。
+        // 倍々（上限 500ms）なら 0・100・300・700・1200・1700 ms の 6 回前後なので、10 回以上で区別する。
+        // 上は詰めて呼んでいないことの確かめ
         assert!(
-            (7..=12).contains(&stale_reads),
+            (10..=22).contains(&stale_reads),
             "古い間に {stale_reads} 回読んだ"
         );
         // kagelife が起動し直して新しいファイルを書いた
         log.lock().unwrap().replace = Some(Ok(remote_json("127.0.0.1:43999", 1)));
         let took = poll_until(&mut loc, "127.0.0.1:50002", ms(50), ms(2000));
-        // 間隔 100ms + 主ループの 50ms + 余裕。本番の尺度では 3 秒以内に当たる
-        assert!(took < ms(300), "切り替わるまで {took:?}");
+        // 間隔 100ms + 主ループの 50ms + CI の遅れの余裕。本番の尺度（10 倍）でも 3.5 秒以内に当たる
+        assert!(took < ms(350), "切り替わるまで {took:?}");
         let l = log.lock().unwrap();
         assert!(l.stopped[0].load(Ordering::SeqCst), "古いトンネルを止める");
     }
