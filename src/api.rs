@@ -146,9 +146,28 @@ const POST_TIMEOUT: Duration = Duration::from_millis(2500);
 /// GET（state・previews）の待ち時間の上限。取り直しはすぐ次が来るので、入力を止める時間を短くする。
 const GET_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// HTTP で制御口を呼ぶ。接続の失敗と 401 のときは発見ファイルを読み直す。
+/// 繋ぎ先（addr と token）を見つける。最初・接続の失敗・401 のときに呼ぶ。
+/// Err の文は offline の理由としてそのまま使う（トークンを入れない）。
+pub trait Locate {
+    fn locate(&mut self) -> Result<Discovery, String>;
+}
+
+/// この機械の発見ファイルを読む。
+pub struct FileLocator(pub Option<PathBuf>);
+
+impl Locate for FileLocator {
+    fn locate(&mut self) -> Result<Discovery, String> {
+        let p = self
+            .0
+            .as_ref()
+            .ok_or_else(|| "発見ファイルの場所が決まらない".to_string())?;
+        discovery::load(p).map_err(|e| e.to_string())
+    }
+}
+
+/// HTTP で制御口を呼ぶ。接続の失敗と 401 のときは繋ぎ先を見つけ直す。
 pub struct HttpControl {
-    path: Option<PathBuf>,
+    source: Box<dyn Locate>,
     disc: Option<Discovery>,
     get_agent: ureq::Agent,
     post_agent: ureq::Agent,
@@ -171,8 +190,13 @@ type Exchange = Result<(u16, Vec<u8>), String>;
 impl HttpControl {
     /// path は発見ファイルの場所。None なら常に offline。
     pub fn new(path: Option<PathBuf>) -> Self {
+        Self::with_locator(Box::new(FileLocator(path)))
+    }
+
+    /// 繋ぎ先の見つけ方を指定する（ssh 越しのモードなど）。
+    pub fn with_locator(source: Box<dyn Locate>) -> Self {
         Self {
-            path,
+            source,
             disc: None,
             get_agent: agent(GET_TIMEOUT),
             post_agent: agent(POST_TIMEOUT),
@@ -205,12 +229,8 @@ impl HttpControl {
         Ok((code, bytes))
     }
 
-    fn load(&self) -> Result<Discovery, ApiError> {
-        let p = self
-            .path
-            .as_ref()
-            .ok_or_else(|| ApiError::Offline("発見ファイルの場所が決まらない".into()))?;
-        discovery::load(p).map_err(|e| ApiError::Offline(e.to_string()))
+    fn load(&mut self) -> Result<Discovery, ApiError> {
+        self.source.locate().map_err(ApiError::Offline)
     }
 
     /// 要求を送る。接続の失敗・401 のときは発見ファイルを読み直し、中身が変わっていれば 1 回だけ送り直す。
@@ -663,6 +683,49 @@ mod tests {
         let f = TempFile::new("post-wait");
         f.write(&addr, "t");
         HttpControl::new(Some(f.0.clone())).set_bpm(120.0).unwrap();
+    }
+
+    /// 呼ばれるたびに次の結果を返す発見（尽きたら最後のものを返し続ける）。
+    struct SeqLocator(Vec<Result<Discovery, String>>, std::sync::Arc<std::sync::Mutex<usize>>);
+    impl Locate for SeqLocator {
+        fn locate(&mut self) -> Result<Discovery, String> {
+            *self.1.lock().unwrap() += 1;
+            if self.0.len() > 1 {
+                self.0.remove(0)
+            } else {
+                self.0[0].clone()
+            }
+        }
+    }
+
+    fn disc(addr: &str, token: &str) -> Discovery {
+        Discovery {
+            addr: addr.into(),
+            token: token.into(),
+            pid: 0,
+            shader_dir: String::new(),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn 発見の仕方を差し替えられ_失敗のときに聞き直して変われば送り直す() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let (live, rx) = fake_server(vec![(200, r#"{"active":"q"}"#)]);
+        let n = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut c = HttpControl::with_locator(Box::new(SeqLocator(
+            vec![Err("準備中".into()), Ok(disc(&dead, "t1")), Ok(disc(&live, "t2"))],
+            n.clone(),
+        )));
+        // 1 回目: 発見がまだ無い → offline（その文をそのまま返す）
+        assert_eq!(c.state().unwrap_err(), ApiError::Offline("準備中".into()));
+        // 2 回目: 死んだ addr に送って失敗 → 聞き直すと変わっている → 送り直して通る
+        assert_eq!(c.state().unwrap().active, "q");
+        assert_eq!(*n.lock().unwrap(), 3);
+        assert_eq!(rx.recv().unwrap().auth.as_deref(), Some("Bearer t2"));
     }
 
     #[test]

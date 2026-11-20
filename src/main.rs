@@ -8,6 +8,7 @@ mod discovery;
 mod hw;
 mod render;
 mod runner;
+mod ssh;
 mod tap;
 mod view;
 
