@@ -1,6 +1,6 @@
 # kagelife-deck
 
-Stream Deck MK.2 から [kagelife](https://github.com/cyokozai/kagelife) を操作する Linux の常駐アプリです。kagelife と同じ機械で動かし、kagelife の制御口 v1（localhost の HTTP/JSON）を呼びます。
+Stream Deck MK.2 から [kagelife](https://github.com/cyokozai/kagelife) を操作する常駐アプリです（Linux・macOS）。kagelife と同じ機械で動かすか、`--ssh` で kagelife が動く別の機械へ ssh のトンネルを張り、kagelife の制御口 v1（localhost の HTTP/JSON）を呼びます。
 
 - 左 3 列 × 3 行のキーは、kagelife の数字キー 1〜9 と同じスロットです。kagelife が対応していれば、各キーにそのシェーダの動くプレビューが出ます
 - タップ BPM、fade と cut の切替、拍数の増減、状態の表示を右 2 列に置いています
@@ -73,10 +73,42 @@ journalctl --user -u kagelife-deck -f    # ログを見る
 
 kagelife より先に起動しても構いません。kagelife が起動すると自動で繋がります。
 
+## 導入（macOS・Apple Silicon）
+
+udev の設定は要りません。Elgato の公式アプリが動いていると Stream Deck を取り合うので、終了しておきます。
+
+### 1. 実行ファイルを取る
+
+CI（GitHub Actions の macOS のジョブ）が作った artifact `kagelife-deck-aarch64-apple-darwin` を使います。
+
+```sh
+D=$(mktemp -d)
+gh run download <run-id> --repo cyokozai/kagelife-deck -n kagelife-deck-aarch64-apple-darwin -D "$D"
+mkdir -p ~/.local/bin && install -m 755 "$D/kagelife-deck" ~/.local/bin/kagelife-deck
+```
+
+ブラウザで取った場合は、`xattr -d com.apple.quarantine ~/.local/bin/kagelife-deck` で quarantine 属性を外します。
+
+### 2. 繋ぐ
+
+- kagelife が同じ Mac で動くとき: `kagelife-deck`
+- kagelife が別の Linux 機で動くとき: その機械に鍵で ssh できるようにし（`ssh -o BatchMode=yes pc01 true` が通ること）、`kagelife-deck --ssh pc01`
+
+### 3. launchd で常駐させる（任意）
+
+`packaging/dev.kagelife.deck.plist` の USERNAME と宛先を書き換えてから、次を実行します。
+
+```sh
+cp packaging/dev.kagelife.deck.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kagelife.deck.plist
+```
+
+止めるときは `launchctl bootout gui/$(id -u)/dev.kagelife.deck` です。ログは `~/Library/Logs/kagelife-deck.log` に出ます。
+
 ## 使い方
 
 ```text
-kagelife-deck [--poll-hz <Hz>] [--brightness <0-100>] [--control-file <path>]
+kagelife-deck [--poll-hz <Hz>] [--brightness <0-100>] [--control-file <path> | --ssh <host> [--remote-control-file <path>]]
 ```
 
 | 引数 | 既定 | 意味 |
@@ -84,15 +116,24 @@ kagelife-deck [--poll-hz <Hz>] [--brightness <0-100>] [--control-file <path>]
 | `--poll-hz` | 2 | `GET /v1/state` を取り直す頻度（0.1〜30）。プレビューはこれと別に 10 Hz で取ります（Stream Deck が挿さっている間だけ） |
 | `--brightness` | 60 | Stream Deck の明るさ（0〜100） |
 | `--control-file` | 下を参照 | kagelife の発見ファイル |
+| `--ssh` | なし | kagelife が動く別の機械の ssh の宛先。相手の発見ファイルを ssh で読み、`127.0.0.1` の空きポートからトンネルを張って繋ぐ。`--control-file` とは同時に使えない |
+| `--remote-control-file` | `~/.cache/kagelife/control.json` | `--ssh` の相手の発見ファイルの場所（相手のシェルが `~` を展開する） |
 
 発見ファイルは次の順に探します。
 
 1. `--control-file`
 2. 環境変数 `KAGELIFE_CONTROL_FILE`
-3. `$XDG_CACHE_HOME/kagelife/control.json`
-4. `~/.cache/kagelife/control.json`
+3. Linux: `$XDG_CACHE_HOME/kagelife/control.json`、無ければ `~/.cache/kagelife/control.json`
+4. macOS: `~/Library/Caches/kagelife/control.json`
 
 3 と 4 は kagelife（Go の `os.UserCacheDir`）と同じ規則です。kagelife とこのアプリで環境変数が違うと、別の場所を見てしまいます。systemd --user から起動するときは特に気をつけてください。
+
+### ssh 越しのモード
+
+- 繋ぐとき（最初・繋がらないとき・401）に、相手の発見ファイルを ssh で読み直します
+- kagelife を起動し直して addr が変わったとき、トンネルが切れたときは、張り直します（間隔は 1〜10 秒）
+- トークンは ssh の引数にもログにも出しません
+- SIGINT・SIGTERM で終わるときは、トンネルの ssh も止めます。SIGKILL では止められません
 
 ## kagelife の制御口 v1 への依存
 
