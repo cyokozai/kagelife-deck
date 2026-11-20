@@ -14,10 +14,10 @@ use crate::api::Locate;
 use crate::discovery::{self, Discovery, DiscoveryError};
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 /// `--remote-control-file` の既定。相手のシェルが `~` を展開する。
@@ -32,39 +32,65 @@ pub const READY_LIMIT: Duration = Duration::from_secs(10);
 pub const READY_STEP: Duration = Duration::from_millis(100);
 /// 裏のスレッドがトンネルの子プロセスの生死を確かめる間隔。
 pub const CHECK_EVERY: Duration = Duration::from_secs(1);
-/// 張り直しの間隔の最小と最大。失敗が続く・何も変わらないと倍にしていく。
+/// 読み直しの間隔。ssh cat が読めた（結果が同じでも）ときは BACKOFF_MIN の一定の間隔、
+/// ssh 自体が失敗したときだけ BACKOFF_MAX まで倍々にする。
+///
+/// kagelife が落ちても発見ファイルは残り（消すのは正常終了のときだけ）、起動し直すと新しいファイルが書かれる。
+/// 古いファイルが読める間に間隔を伸ばすと、新しいファイルに気づくのが遅れて VJ の画面の操作が戻らない。
+/// そのため kagelife が長く止まっている間も、主ループが失敗を報告するたびに 1 秒ごとに `ssh cat` を起動する
+/// （1 回の ssh は軽く、ライブ中に操作が戻るまでの時間のほうが大事なので許容する）。
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
-pub const BACKOFF_MAX: Duration = Duration::from_secs(10);
+pub const BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// 要求が失敗した直後に、裏のスレッドの新しい結果を待つ上限。主ループ（キーの読み出し）はこれだけ余分に止まりうる。
+pub const RELOCATE_WAIT: Duration = Duration::from_millis(300);
+
+/// ユーザーの ~/.ssh/config の多重化（ControlMaster・ControlPersist）を使わない。
+/// 使うと転送が master に渡されて ssh がすぐ終わり、トンネルが死んだと見なして張り直しを繰り返すため。
+fn no_mux(v: &mut Vec<String>) {
+    v.extend(
+        ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+}
 
 /// 相手の発見ファイルを読む ssh の引数（プログラム名を除く）。
 pub fn cat_args(host: &str, remote_file: &str) -> Vec<String> {
-    vec![
+    let mut v: Vec<String> = vec![
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
         format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
-        host.into(),
-        "cat".into(),
-        remote_file.into(),
-    ]
+    ];
+    no_mux(&mut v);
+    v.extend([host.into(), "cat".into(), remote_file.into()]);
+    v
 }
 
 /// トンネルを張る ssh の引数（プログラム名を除く）。
+/// ServerAlive は 2 秒 × 2 回: Wi-Fi が切れた後、死んだトンネルを使い回す時間を 4〜6 秒に抑える。
 pub fn forward_args(host: &str, local_port: u16, remote_addr: &str) -> Vec<String> {
-    vec![
+    let mut v: Vec<String> = vec![
         "-N".into(),
         "-o".into(),
         "BatchMode=yes".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=5".into(),
-        "-o".into(),
-        "ServerAliveCountMax=2".into(),
-        "-L".into(),
-        format!("127.0.0.1:{local_port}:{remote_addr}"),
-        host.into(),
-    ]
+    ];
+    no_mux(&mut v);
+    v.extend(
+        [
+            "-o",
+            "ServerAliveInterval=2",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-L",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    v.extend([format!("127.0.0.1:{local_port}:{remote_addr}"), host.into()]);
+    v
 }
 
 /// 相手の発見ファイルを解析する。エラー文に中身（トークン）を出さない。
@@ -200,6 +226,14 @@ impl<E: SshExec> Tunneler<E> {
         Ok(())
     }
 
+    /// 生きたトンネルを張っているか。
+    pub fn has_live_tunnel(&mut self) -> bool {
+        match self.tunnel.as_mut() {
+            Some(t) => t.proc.alive(),
+            None => false,
+        }
+    }
+
     /// トンネルの子プロセスが死んでいるか（張っていなければ false）。
     pub fn tunnel_dead(&mut self) -> bool {
         match self.tunnel.as_mut() {
@@ -252,30 +286,57 @@ impl Backoff {
             .map_or(Duration::ZERO, |n| n.saturating_duration_since(now))
     }
 
-    /// 試した後に呼ぶ。progressed は「結果が変わって前に進んだ」。前に進めば間隔を最小に戻し、
-    /// 失敗や同じ結果が続けば倍にしていく。
-    pub fn after(&mut self, now: Instant, progressed: bool) {
-        if progressed {
-            self.step = self.min;
-            self.next = Some(now + self.min);
-        } else {
-            self.next = Some(now + self.step);
-            self.step = (self.step * 2).min(self.max);
+    /// 試した後に呼ぶ。読めたら（結果が同じでも）最小の一定の間隔に戻し、ssh が失敗したときだけ倍にしていく。
+    pub fn after(&mut self, now: Instant, outcome: Outcome) {
+        match outcome {
+            Outcome::Changed | Outcome::Same => {
+                self.step = self.min;
+                self.next = Some(now + self.min);
+            }
+            Outcome::Failed => {
+                self.next = Some(now + self.step);
+                self.step = (self.step * 2).min(self.max);
+            }
         }
     }
+
+    /// 次に試せる時刻（None ならすぐ）。
+    pub fn next(&self) -> Option<Instant> {
+        self.next
+    }
+}
+
+/// 1 回の読み直しの結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// 読めて、繋ぎ先が変わった
+    Changed,
+    /// 読めたが、繋ぎ先は前と同じ（kagelife が落ちて古いファイルが残っているときもこれ）
+    Same,
+    /// ssh 自体・解析・トンネルの準備が失敗した
+    Failed,
 }
 
 /// 裏のスレッドが作った最新の結果。
 struct Published {
     current: Option<Discovery>,
     error: String,
+    /// 読み直しを終えた回数（relocate が新しい結果を待つのに使う）
+    rounds: u64,
+    /// 裏のスレッドが読み直しの最中か
+    busy: bool,
+    /// 裏のスレッドが次に読み直せる時刻（None ならすぐ）
+    next_try: Option<Instant>,
 }
 
-/// ssh 越しの発見。主ループからは待たずに最新の結果を受け取る。
+type SharedState = Arc<(Mutex<Published>, Condvar)>;
+
+/// ssh 越しの発見。主ループからは待たずに（失敗の直後だけ RELOCATE_WAIT まで）最新の結果を受け取る。
 pub struct SshLocator {
     tx: Option<Sender<()>>,
-    shared: Arc<Mutex<Published>>,
+    shared: SharedState,
     worker: Option<std::thread::JoinHandle<()>>,
+    relocate_wait: Duration,
 }
 
 impl SshLocator {
@@ -286,10 +347,16 @@ impl SshLocator {
         check_every: Duration,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Mutex::new(Published {
-            current: None,
-            error: "ssh で繋ぐ準備をしている".into(),
-        }));
+        let shared: SharedState = Arc::new((
+            Mutex::new(Published {
+                current: None,
+                error: "ssh で繋ぐ準備をしている".into(),
+                rounds: 0,
+                busy: false,
+                next_try: None,
+            }),
+            Condvar::new(),
+        ));
         let s2 = shared.clone();
         let worker = std::thread::Builder::new()
             .name("kagelife-deck-ssh".into())
@@ -299,18 +366,54 @@ impl SshLocator {
             tx: Some(tx),
             shared,
             worker: Some(worker),
+            relocate_wait: RELOCATE_WAIT,
         }
     }
+
+    fn ask(&self) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn result_of(p: &Published) -> Result<Discovery, String> {
+    p.current.clone().ok_or_else(|| p.error.clone())
 }
 
 impl Locate for SshLocator {
     /// 裏のスレッドに見つけ直しを頼み、待たずに最新の結果を返す。
     fn locate(&mut self) -> Result<Discovery, String> {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(());
+        self.ask();
+        result_of(&lock(&self.shared.0))
+    }
+
+    /// prev に送って失敗した直後。裏のスレッドに見つけ直しを頼み、頼んだ後に始まった読み直しが終わるまで
+    /// 最大 relocate_wait 待つ。間隔が明けるのが待ちの上限より後なら待たない。
+    fn relocate(&mut self, prev: &Discovery) -> Result<Discovery, String> {
+        let deadline = Instant::now() + self.relocate_wait;
+        let (m, cv) = &*self.shared;
+        let mut p = lock(m);
+        // 読み直しの最中なら、それは頼む前に始まったものなので、もう 1 回分待つ
+        let want_gen = p.rounds + if p.busy { 2 } else { 1 };
+        self.ask();
+        loop {
+            if p.current.as_ref().is_some_and(|c| c != prev) || p.rounds >= want_gen {
+                break;
+            }
+            if !p.busy && p.next_try.is_some_and(|n| n > deadline) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            p = cv
+                .wait_timeout(p, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
-        let p = lock(&self.shared);
-        p.current.clone().ok_or_else(|| p.error.clone())
+        result_of(&p)
     }
 }
 
@@ -334,9 +437,10 @@ fn worker<E: SshExec>(
     mut t: Tunneler<E>,
     mut backoff: Backoff,
     rx: Receiver<()>,
-    shared: Arc<Mutex<Published>>,
+    shared: SharedState,
     check_every: Duration,
 ) {
+    let (m, cv) = &*shared;
     // 最初の 1 回は頼まれなくても行う
     let mut wanted = true;
     let mut last_error = String::new();
@@ -361,7 +465,8 @@ fn worker<E: SshExec>(
         if t.tunnel_dead() {
             (t.log)(format!("ssh {} のトンネルが切れた。張り直す", t.host));
             t.stop();
-            lock(&shared).current = None;
+            lock(m).current = None;
+            cv.notify_all();
             wanted = true;
         }
         let now = Instant::now();
@@ -369,86 +474,143 @@ fn worker<E: SshExec>(
             continue;
         }
         wanted = false;
+        lock(m).busy = true;
         let r = t.refresh();
-        let mut p = lock(&shared);
+        let live = t.has_live_tunnel();
+        let mut p = lock(m);
         match r {
             Ok(d) => {
-                let progressed = p.current.as_ref() != Some(&d);
-                backoff.after(now, progressed);
+                let outcome = if p.current.as_ref() == Some(&d) {
+                    Outcome::Same
+                } else {
+                    Outcome::Changed
+                };
+                backoff.after(now, outcome);
                 p.current = Some(d);
                 last_error.clear();
             }
             Err(e) => {
-                backoff.after(now, false);
+                backoff.after(now, Outcome::Failed);
                 if e != last_error {
                     (t.log)(e.clone());
                     last_error = e.clone();
                 }
-                p.current = None;
+                // ssh cat だけが失敗した（Wi-Fi の瞬断など）でトンネルが生きていれば、繋ぎ先を残して HTTP を試させる
+                if !live {
+                    p.current = None;
+                }
                 p.error = e;
             }
         }
+        p.rounds += 1;
+        p.busy = false;
+        p.next_try = backoff.next();
+        drop(p);
+        cv.notify_all();
     }
 }
 
 /// 動いている ssh の子プロセスの登録簿。終了の合図・panic のときに全部止めるため（孤児の ssh を残さない）。
 pub struct Registry {
-    children: Mutex<Vec<(u64, Child)>>,
+    inner: Mutex<RegistryInner>,
     next: AtomicU64,
+}
+
+struct RegistryInner {
+    children: Vec<(u64, Child)>,
+    /// kill_all の後。新しい子プロセスを起動しない
+    closed: bool,
+}
+
+/// 登録簿に載せて起動した子プロセスの番号とパイプ。
+struct Spawned {
+    id: u64,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
 }
 
 /// このプロセスの登録簿。
 pub static CHILDREN: Registry = Registry::new();
 
+/// panic の中の後始末で、登録簿のロックが空くのを待つ上限。
+const KILL_LOCK_WAIT: Duration = Duration::from_millis(500);
+
 impl Registry {
     pub const fn new() -> Self {
         Self {
-            children: Mutex::new(Vec::new()),
+            inner: Mutex::new(RegistryInner {
+                children: Vec::new(),
+                closed: false,
+            }),
             next: AtomicU64::new(1),
         }
     }
 
-    fn add(&self, c: Child) -> u64 {
+    /// 登録簿のロックを持ったまま起動して登録する。起動してから登録するまでの間に kill_all が走り、
+    /// 登録されない ssh が残る隙間を作らないため。kill_all の後は起動しない。
+    fn spawn(&self, cmd: &mut Command) -> Result<Spawned, String> {
+        let mut g = lock(&self.inner);
+        if g.closed {
+            return Err("終了の処理の後なので起動しない".into());
+        }
+        let mut c = cmd.spawn().map_err(|e| format!("起動できない: {e}"))?;
+        // 標準出力・標準エラーのパイプは呼び出し側が持つ
+        let stdout = c.stdout.take();
+        let stderr = c.stderr.take();
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        lock(&self.children).push((id, c));
-        id
+        g.children.push((id, c));
+        Ok(Spawned { id, stdout, stderr })
     }
 
     /// None: 登録簿に無い（止めた・kill_all で止まった）。Some(None): 動いている。Some(Some(s)): 終わった
     fn try_wait(&self, id: u64) -> Option<Option<ExitStatus>> {
-        let mut g = lock(&self.children);
-        let (_, c) = g.iter_mut().find(|(i, _)| *i == id)?;
+        let mut g = lock(&self.inner);
+        let (_, c) = g.children.iter_mut().find(|(i, _)| *i == id)?;
         Some(c.try_wait().ok().flatten())
     }
 
-    /// 登録簿から外す。kill が真なら止めてから外す。
+    /// 登録簿から外す。kill が真なら、ロックの中で止めてから外す。
     fn remove(&self, id: u64, kill: bool) {
         let c = {
-            let mut g = lock(&self.children);
-            g.iter()
+            let mut g = lock(&self.inner);
+            let c = g
+                .children
+                .iter()
                 .position(|(i, _)| *i == id)
-                .map(|at| g.swap_remove(at).1)
+                .map(|at| g.children.swap_remove(at).1);
+            c.map(|mut c| {
+                if kill {
+                    let _ = c.kill();
+                }
+                c
+            })
         };
         if let Some(mut c) = c {
-            if kill {
-                let _ = c.kill();
-            }
             let _ = c.wait();
         }
     }
 
-    /// 登録した子プロセスを全部止める。block が偽なら、ロックが取れないとき何もしない（panic の中で使う）。
+    /// 登録した子プロセスを全部止め、以後の起動を断る。
+    /// block が偽（panic の中）なら、ロックが空くのを KILL_LOCK_WAIT まで待つ（同じスレッドがロックを持ったまま
+    /// panic したときに止まり続けないよう、上限を付ける）。
     pub fn kill_all(&self, block: bool) {
         let mut g = if block {
-            lock(&self.children)
+            lock(&self.inner)
         } else {
-            match self.children.try_lock() {
-                Ok(g) => g,
-                Err(TryLockError::Poisoned(p)) => p.into_inner(),
-                Err(TryLockError::WouldBlock) => return,
+            let deadline = Instant::now() + KILL_LOCK_WAIT;
+            loop {
+                match self.inner.try_lock() {
+                    Ok(g) => break g,
+                    Err(TryLockError::Poisoned(p)) => break p.into_inner(),
+                    Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(TryLockError::WouldBlock) => return,
+                }
             }
         };
-        for (_, mut c) in g.drain(..) {
+        g.closed = true;
+        for (_, mut c) in g.children.drain(..) {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -456,7 +618,7 @@ impl Registry {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        lock(&self.children).len()
+        lock(&self.inner).children.len()
     }
 }
 
@@ -472,7 +634,7 @@ pub fn run_limited(reg: &Registry, mut cmd: Command, limit: Duration) -> Result<
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("起動できない: {e}"))?;
+    let Spawned { id, stdout, stderr } = reg.spawn(&mut cmd)?;
     let drain = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut b = Vec::new();
@@ -482,19 +644,8 @@ pub fn run_limited(reg: &Registry, mut cmd: Command, limit: Duration) -> Result<
             b
         })
     };
-    let out = drain(
-        child
-            .stdout
-            .take()
-            .map(|r| Box::new(r) as Box<dyn Read + Send>),
-    );
-    let err = drain(
-        child
-            .stderr
-            .take()
-            .map(|r| Box::new(r) as Box<dyn Read + Send>),
-    );
-    let id = reg.add(child);
+    let out = drain(stdout.map(|r| Box::new(r) as Box<dyn Read + Send>));
+    let err = drain(stderr.map(|r| Box::new(r) as Box<dyn Read + Send>));
     let deadline = Instant::now() + limit;
     let status = loop {
         match reg.try_wait(id) {
@@ -585,16 +736,17 @@ impl SshExec for SystemSsh {
     }
 
     fn spawn(&mut self, args: &[String]) -> Result<Box<dyn TunnelProc>, String> {
-        let child = Command::new(&self.program)
-            .args(args)
+        let mut cmd = Command::new(&self.program);
+        cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // ssh の警告（転送の失敗など）はこのプロセスの標準エラーにそのまま出す
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        let id = self.reg.add(child);
-        Ok(Box::new(RegisteredProc { reg: self.reg, id }))
+            .stderr(Stdio::inherit());
+        let s = self.reg.spawn(&mut cmd)?;
+        Ok(Box::new(RegisteredProc {
+            reg: self.reg,
+            id: s.id,
+        }))
     }
 
     fn free_port(&mut self) -> Result<u16, String> {
@@ -669,6 +821,53 @@ mod system_tests {
     }
 
     #[test]
+    fn 終了の処理の後は新しい子プロセスを起動しない() {
+        let r: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let mut ex = SystemSsh::with_program("sleep", r);
+        r.kill_all(true);
+        assert!(ex.spawn(&["30".to_string()]).is_err());
+        assert!(run_limited(r, sh("printf x"), Duration::from_secs(5)).is_err());
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn 起動と登録は登録簿のロックの中で行う() {
+        // ロックを他のスレッドが持っている間は、起動そのものを待つ（起動してから登録するまでの隙間を作らない）
+        let r: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let held = lock(&r.inner);
+        let h = std::thread::spawn(move || {
+            let mut ex = SystemSsh::with_program("sleep", r);
+            ex.spawn(&["30".to_string()]).unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!h.is_finished(), "ロックの外で起動している");
+        drop(held);
+        let mut p = h.join().unwrap();
+        assert!(p.alive());
+        r.kill_all(true);
+        assert!(!p.alive());
+    }
+
+    #[test]
+    fn panic_の中の後始末はロックを少し待ってから止める() {
+        let r: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let mut ex = SystemSsh::with_program("sleep", r);
+        let mut p = ex.spawn(&["30".to_string()]).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let _held = lock(&r.inner);
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        rx.recv().unwrap();
+        // ロックが 50ms 後に空く。block=false でも諦めずに待って止める
+        r.kill_all(false);
+        h.join().unwrap();
+        assert!(!p.alive());
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
     fn 空きポートと繋がるかの確かめ() {
         let r: &'static Registry = Box::leak(Box::new(Registry::new()));
         let mut ex = SystemSsh::with_program("ssh", r);
@@ -703,6 +902,10 @@ mod tests {
         alive: Vec<Arc<AtomicBool>>,
         stopped: Vec<Arc<AtomicBool>>,
         logs: Vec<String>,
+        /// Some なら files の代わりにこれを返し続ける（途中で相手のファイルを書き換える）
+        replace: Option<Result<Vec<u8>, String>>,
+        /// 読み出しにかかる時間
+        read_delay: Duration,
     }
     type Shared = Arc<Mutex<FakeLog>>;
 
@@ -730,7 +933,15 @@ mod tests {
     }
     impl SshExec for FakeExec {
         fn read(&mut self, args: &[String]) -> Result<Vec<u8>, String> {
-            self.log.lock().unwrap().reads.push(args.to_vec());
+            let (replace, delay) = {
+                let mut l = self.log.lock().unwrap();
+                l.reads.push(args.to_vec());
+                (l.replace.clone(), l.read_delay)
+            };
+            std::thread::sleep(delay);
+            if let Some(r) = replace {
+                return r;
+            }
             if self.files.len() > 1 {
                 self.files.remove(0)
             } else {
@@ -788,6 +999,10 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=5",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "pc01",
                 "cat",
                 "~/.cache/kagelife/control.json"
@@ -806,7 +1021,11 @@ mod tests {
                 "-o",
                 "ExitOnForwardFailure=yes",
                 "-o",
-                "ServerAliveInterval=5",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ServerAliveInterval=2",
                 "-o",
                 "ServerAliveCountMax=2",
                 "-L",
@@ -956,25 +1175,174 @@ mod tests {
     }
 
     #[test]
-    fn 間隔は失敗や同じ結果が続くと倍になり_前に進めば戻る() {
+    fn 間隔は_ssh_の失敗だけ倍になり_読めれば同じ結果でも一定() {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         let mut b = Backoff::new(ms(100), ms(350));
         assert!(b.ready(t0));
-        b.after(t0, false);
-        assert!(!b.ready(t0 + ms(99)));
-        assert!(b.ready(t0 + ms(100)));
+        // 読めて結果が同じ（kagelife が落ちて古いファイルが残っている）間は、一定の間隔
+        for _ in 0..5 {
+            b.after(t0, Outcome::Same);
+            assert!(!b.ready(t0 + ms(99)));
+            assert!(b.ready(t0 + ms(100)));
+        }
         assert_eq!(b.wait(t0 + ms(40)), ms(60));
-        b.after(t0, false);
+        // ssh が失敗したら倍々
+        b.after(t0, Outcome::Failed);
+        assert!(b.ready(t0 + ms(100)));
+        b.after(t0, Outcome::Failed);
         assert!(!b.ready(t0 + ms(199)));
         assert!(b.ready(t0 + ms(200)));
-        b.after(t0, false);
-        b.after(t0, false);
+        b.after(t0, Outcome::Failed);
+        b.after(t0, Outcome::Failed);
         // 上限で止まる
+        assert!(!b.ready(t0 + ms(349)));
         assert!(b.ready(t0 + ms(350)));
-        b.after(t0, true);
+        // 読めたら最小に戻る
+        b.after(t0, Outcome::Same);
+        assert!(b.ready(t0 + ms(100)));
+        b.after(t0, Outcome::Failed);
+        b.after(t0, Outcome::Changed);
         assert!(b.ready(t0 + ms(100)));
         assert_eq!(b.wait(t0 + ms(200)), Duration::ZERO);
+    }
+
+    #[test]
+    fn 本番の間隔は新しい発見ファイルに3秒以内に気づける() {
+        // 古いファイルが残る間の読み直しの間隔 + ssh cat の時間（LAN で 1 秒未満を見込む）が 3 秒以内
+        assert!(BACKOFF_MIN <= Duration::from_secs(2));
+        assert!(BACKOFF_MAX <= Duration::from_secs(5));
+        assert!(RELOCATE_WAIT <= Duration::from_millis(300));
+    }
+
+    /// 主ループの代わりに、offline の間 every ごとに locate を呼び、want の addr が返るまでの時間を返す。
+    fn poll_until(loc: &mut SshLocator, want: &str, every: Duration, limit: Duration) -> Duration {
+        let start = Instant::now();
+        loop {
+            if let Ok(d) = loc.locate()
+                && d.addr == want
+            {
+                return start.elapsed();
+            }
+            assert!(start.elapsed() < limit, "{want} にならない");
+            std::thread::sleep(every);
+        }
+    }
+
+    #[test]
+    fn 古いファイルが残りトンネルが生きている間も読み直し続け_新しいファイルにすぐ切り替わる() {
+        // 本番の場面: kagelife が落ちても発見ファイルは残り、3 秒後に起動し直されて新しいファイルが書かれる。
+        // トンネルの ssh は生きたまま。間隔は本番の 1/10（min 100ms・max 500ms）で測る
+        let (t, log) = tunneler(vec![Ok(remote_json("127.0.0.1:43210", 1))]);
+        let ms = Duration::from_millis;
+        let mut loc = SshLocator::start(t, Backoff::new(ms(100), ms(500)), ms(20));
+        poll_until(&mut loc, "127.0.0.1:50001", ms(10), ms(2000));
+        // kagelife が落ちた。主ループは失敗のたびに locate を呼ぶ（0.5 秒ごとの代わりに 50ms ごと）
+        let reads0 = log.lock().unwrap().reads.len();
+        let start = Instant::now();
+        while start.elapsed() < ms(1000) {
+            assert!(
+                loc.locate().is_ok(),
+                "トンネルは生きているので current は残る"
+            );
+            std::thread::sleep(ms(50));
+        }
+        let stale_reads = log.lock().unwrap().reads.len() - reads0;
+        // 倍々にしないので 1 秒で 100ms ごとに 10 回前後。詰めて呼んでもいない
+        assert!(
+            (7..=12).contains(&stale_reads),
+            "古い間に {stale_reads} 回読んだ"
+        );
+        // kagelife が起動し直して新しいファイルを書いた
+        log.lock().unwrap().replace = Some(Ok(remote_json("127.0.0.1:43999", 1)));
+        let took = poll_until(&mut loc, "127.0.0.1:50002", ms(50), ms(2000));
+        // 間隔 100ms + 主ループの 50ms + 余裕。本番の尺度では 3 秒以内に当たる
+        assert!(took < ms(300), "切り替わるまで {took:?}");
+        let l = log.lock().unwrap();
+        assert!(l.stopped[0].load(Ordering::SeqCst), "古いトンネルを止める");
+    }
+
+    #[test]
+    fn ssh_cat_が失敗してもトンネルが生きていれば繋ぎ先を残す() {
+        let (t, log) = tunneler(vec![Ok(remote_json("127.0.0.1:43210", 1))]);
+        let ms = Duration::from_millis;
+        let mut loc = SshLocator::start(t, Backoff::new(ms(20), ms(100)), ms(10));
+        poll_until(&mut loc, "127.0.0.1:50001", ms(5), ms(2000));
+        // Wi-Fi の瞬断: ssh cat は失敗するが、トンネルの ssh はまだ生きている
+        log.lock().unwrap().replace = Some(Err("ssh: connect timed out".into()));
+        let reads0 = log.lock().unwrap().reads.len();
+        let start = Instant::now();
+        while start.elapsed() < ms(200) {
+            let d = loc.locate().expect("トンネルが生きている間は繋ぎ先を返す");
+            assert_eq!(d.addr, "127.0.0.1:50001");
+            std::thread::sleep(ms(10));
+        }
+        assert!(
+            log.lock().unwrap().reads.len() > reads0,
+            "読み直しは試している"
+        );
+        // トンネルも死んだら繋ぎ先を消す
+        log.lock().unwrap().alive[0].store(false, Ordering::SeqCst);
+        let start = Instant::now();
+        while loc.locate().is_ok() {
+            assert!(start.elapsed() < ms(1000), "死んだトンネルを返し続ける");
+            std::thread::sleep(ms(5));
+        }
+    }
+
+    fn first_ok(loc: &mut SshLocator) -> Discovery {
+        let start = Instant::now();
+        loop {
+            if let Ok(d) = loc.locate() {
+                return d;
+            }
+            assert!(start.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn 失敗の直後は新しい結果を少しだけ待てる() {
+        let (t, log) = tunneler(vec![Ok(remote_json("127.0.0.1:43210", 1))]);
+        let ms = Duration::from_millis;
+        let mut loc = SshLocator::start(t, Backoff::new(ms(50), ms(200)), ms(1000));
+        let old = first_ok(&mut loc);
+        std::thread::sleep(ms(60)); // 間隔が明けるのを待つ
+        log.lock().unwrap().replace = Some(Ok(remote_json("127.0.0.1:43999", 1)));
+        let t0 = Instant::now();
+        let d = loc.relocate(&old).unwrap();
+        assert_eq!(
+            d.addr, "127.0.0.1:50002",
+            "1 回の呼び出しで新しい繋ぎ先を受け取る"
+        );
+        assert!(t0.elapsed() < RELOCATE_WAIT + ms(50), "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn 失敗の直後の待ちは上限で打ち切る() {
+        let (t, log) = tunneler(vec![Ok(remote_json("127.0.0.1:43210", 1))]);
+        let ms = Duration::from_millis;
+        let mut loc = SshLocator::start(t, Backoff::new(ms(50), ms(200)), ms(1000));
+        let old = first_ok(&mut loc);
+        std::thread::sleep(ms(60));
+        // ssh cat が 2 秒かかる（相手が遅い）
+        log.lock().unwrap().read_delay = ms(2000);
+        let t0 = Instant::now();
+        let _ = loc.relocate(&old);
+        let took = t0.elapsed();
+        assert!(took >= RELOCATE_WAIT - ms(20), "{took:?}");
+        assert!(took < RELOCATE_WAIT + ms(100), "主ループを {took:?} 止めた");
+    }
+
+    #[test]
+    fn 間隔が明けていなければ失敗の直後でも待たない() {
+        let (t, _log) = tunneler(vec![Ok(remote_json("127.0.0.1:43210", 1))]);
+        let ms = Duration::from_millis;
+        let mut loc = SshLocator::start(t, Backoff::new(ms(5000), ms(5000)), ms(1000));
+        let old = first_ok(&mut loc);
+        let t0 = Instant::now();
+        assert_eq!(loc.relocate(&old).unwrap(), old);
+        assert!(t0.elapsed() < ms(50), "{:?}", t0.elapsed());
     }
 
     #[test]
