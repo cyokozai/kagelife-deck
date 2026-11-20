@@ -23,3 +23,22 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: テスト
         run: cargo test --locked
+
+  # macOS（Apple Silicon）でのテストとリリースビルド。DJ 卓の Mac に置く実行ファイルを作る
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust の stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: テスト
+        run: cargo test --locked
+      - name: リリースビルド
+        run: cargo build --release --locked
+      - name: 実行ファイルを確かめる
+        run: file target/release/kagelife-deck && ls -l target/release/kagelife-deck
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kagelife-deck-aarch64-apple-darwin
+          path: target/release/kagelife-deck
+          if-no-files-found: error
